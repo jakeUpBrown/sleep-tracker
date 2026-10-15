@@ -242,8 +242,8 @@ def chart_minutes(rows, analysis: dict) -> list:
     for r in rows:
         if r.battery is not None:
             battery[r.t - r.t % 60] = r.battery
-    return [{"t": m["t"], "mov": m["mov"], "hr": m["hr"], "bat": battery.get(m["t"])}
-            for m in analysis["minutes"]]
+    return [{"t": m["t"], "mov": m["mov"], "hr": m["hr"], "bat": battery.get(m["t"]), "depth": depth}
+            for m, depth in zip(analysis["minutes"], analysis["depth"])]
 
 
 def simulation(date: str, rows, settings: dict) -> dict | None:

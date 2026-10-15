@@ -36,8 +36,11 @@ DEFAULT_TUNING = {
     "hr_rise_bpm": 8.0,       # heart rate this far above resting counts as light sleep
     "hr_rise_minutes": 2,     # consecutive minutes the heart rate rise must last
     "baseline_minutes": 60,   # window for the resting heart rate
+    "cycle_minutes": 90,      # length of the textbook sleep cycle drawn on the depth chart
+    "depth_smooth_minutes": 5,  # the depth chart averages this many minutes, centred on each
 }
-_TUNING_MINIMUM = {"onset_minutes": 1, "awake_minutes": 1, "hr_rise_minutes": 1, "baseline_minutes": 1}
+_TUNING_MINIMUM = {"onset_minutes": 1, "awake_minutes": 1, "hr_rise_minutes": 1, "baseline_minutes": 1,
+                   "cycle_minutes": 30, "depth_smooth_minutes": 1}
 
 SAMPLES_PER_MINUTE = 750           # 12.5 Hz accelerometer
 AWAKE_LOOKBACK_MINUTES = 5         # the "last 5 minutes" of the awake rule
@@ -52,6 +55,7 @@ HR_RISE_MAX_AGE_SECONDS = 60       # a heart rate rise counts live only if its l
 NO_DATA_SLACK_SECONDS = 60         # data ending this close to latest_start still counts as covering it
 MIN_PLAUSIBLE_UNIX = 1_600_000_000  # watch times before Sept 2020 mean its clock was never set
 LONG_GAP_SECONDS = 3600            # a gap in the data longer than this is not counted as asleep
+STAGE_LEVEL = {"deep": 0, "light": 1, "rem": 2, "awake": 3}  # the depth chart's y axis, bottom to top
 
 # The web app's defaults, so before anything is saved the alarm does what the page shows
 DEFAULT_SETTINGS = {"enabled": True, "alarm_time": "06:30", "window_minutes": 30, "fade_minutes": 15}
@@ -499,6 +503,82 @@ def _asleep_minutes(onset: int | None, end: int | None, not_asleep: list[list[in
     return (end - onset - off) // 60
 
 
+def cycle_stages(start: int, end: int, index: int) -> list[list]:
+    """Textbook stages of sleep cycle number `index` (from 0): light, deep, light, REM, with
+    deep sleep dominating the first cycles and REM the later ones."""
+    deep = max(0.0, 0.40 - 0.12 * index)
+    rem = min(0.45, 0.12 + 0.08 * index)
+    light = 1.0 - deep - rem
+    out: list[list] = []
+    t = start
+    for stage, share in (("light", light * 0.6), ("deep", deep), ("light", light * 0.4), ("rem", rem)):
+        length = int((end - start) * share)
+        if length < 60:
+            continue
+        if out and out[-1][2] == stage:
+            out[-1][1] += length
+        else:
+            out.append([t, t + length, stage])
+        t += length
+    if out:
+        out[-1][1] = end
+    return out
+
+
+def expected_cycles(onset: int | None, end: int | None, cycle_minutes: int) -> list[list]:
+    """A textbook night from onset to end as [start, end, stage] spans in cycle_minutes cycles.
+    Something to hold the measured depth against, not a measurement: real cycles vary."""
+    if onset is None or end is None or end <= onset:
+        return []
+    stages: list[list] = []
+    start, index = onset, 0
+    while start < end:
+        stop = min(start + cycle_minutes * 60, end)
+        stages += cycle_stages(start, stop, index)
+        start, index = stop, index + 1
+    return stages
+
+
+def _clamp01(value: float) -> float:
+    return max(0.0, min(1.0, value))
+
+
+def depth_timeline(minutes: list[Minute], onset: int | None, resting_mov: float | None,
+                   active_threshold: float, resting_hr: float | None, tuning: dict) -> list[float | None]:
+    """How deep each minute looks on the STAGE_LEVEL scale: 0 deep, 1 light, 2 REM-like, 3 awake.
+
+    Movement above resting (reaching 1 at the active threshold) and heart rate above resting
+    (reaching 1 at hr_rise_bpm) each score 0 to 1; their mean, averaged over the
+    depth_smooth_minutes around the minute, is doubled. Minutes before onset and awake minutes
+    are 3; minutes the Detector labelled light sleep are at least 1. An index to look at next to
+    the textbook cycle, not a hypnogram: wrist data cannot tell REM from deep sleep.
+    """
+    raw: list[float | None] = []
+    for m in minutes:
+        parts = []
+        if m.mov is not None and resting_mov is not None and active_threshold > resting_mov:
+            parts.append(_clamp01((m.mov - resting_mov) / (active_threshold - resting_mov)))
+        if m.hr is not None and resting_hr is not None:
+            parts.append(_clamp01((m.hr - resting_hr) / tuning["hr_rise_bpm"]))
+        raw.append(sum(parts) / len(parts) if parts else None)
+    reach = tuning["depth_smooth_minutes"] // 2
+    depth: list[float | None] = []
+    for i, m in enumerate(minutes):
+        if onset is None or m.t < onset or m.awake:
+            depth.append(float(STAGE_LEVEL["awake"]))
+            continue
+        values = [raw[j] for j in range(max(0, i - reach), min(len(minutes), i + reach + 1))
+                  if raw[j] is not None and not minutes[j].awake and abs(minutes[j].t - m.t) <= reach * 60]
+        if not values:
+            depth.append(None)
+            continue
+        level = STAGE_LEVEL["rem"] * sum(values) / len(values)
+        if m.light:
+            level = max(level, float(STAGE_LEVEL["light"]))
+        depth.append(round(level, 2))
+    return depth
+
+
 def analyze(rows: list[Row], tuning: dict | None = None) -> dict:
     """Label a whole night. resting_hr here is the median confident heart rate while asleep."""
     detector = Detector(tuning)
@@ -515,6 +595,8 @@ def analyze(rows: list[Row], tuning: dict | None = None) -> dict:
     sleep_end = final_wake or (minutes[-1].t + 60 if minutes else None)
     asleep_hrs = [m.hr for m in minutes
                   if onset is not None and onset <= m.t < sleep_end and not m.awake and m.hr is not None]
+    resting_hr = _median_sorted(sorted(asleep_hrs)) if asleep_hrs else None
+    tn = detector.tuning
     return {
         "minutes": [m.as_dict() for m in minutes],
         "onset": onset,
@@ -523,8 +605,12 @@ def analyze(rows: list[Row], tuning: dict | None = None) -> dict:
         "light_spans": light_spans,
         "awake_spans": awake_spans,
         "light_minutes": sum(m.light for m in minutes),
-        "resting_hr": round(_median_sorted(sorted(asleep_hrs)), 1) if asleep_hrs else None,
+        "resting_hr": None if resting_hr is None else round(resting_hr, 1),
         "rows": len(rows),
+        # the depth chart: one level per minute, and the textbook cycle to hold it against
+        "depth": depth_timeline(minutes, onset, detector.resting_mov, detector.active_threshold(), resting_hr, tn),
+        "expected_cycles": expected_cycles(onset, sleep_end, tn["cycle_minutes"]),
+        "cycle_minutes": tn["cycle_minutes"],
     }
 
 

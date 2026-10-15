@@ -11,8 +11,8 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from analysis.make_test_night import clock_time, generate, write_csv  # noqa: E402
 from analysis.sleep_analysis import (  # noqa: E402
-    DEFAULT_TUNING, Detector, Row, alarm_unix_for_night, analyze, parse_csv_line, read_rows,
-    simulate_wake, tuning_from_settings,
+    DEFAULT_TUNING, STAGE_LEVEL, Detector, Row, alarm_unix_for_night, analyze, expected_cycles, parse_csv_line,
+    read_rows, simulate_wake, tuning_from_settings,
 )
 
 DATE = "2026-10-12"
@@ -243,7 +243,85 @@ class AnalyzeTests(unittest.TestCase):
     def test_no_rows(self):
         result = analyze([])
         self.assertEqual((result["minutes"], result["onset"], result["final_wake"]), ([], None, None))
+        self.assertEqual((result["depth"], result["expected_cycles"]), ([], []))
         self.assertEqual(result["asleep_minutes"], 0)
+
+
+class DepthTests(unittest.TestCase):
+    """The depth chart: one level per minute on the STAGE_LEVEL scale, and the textbook cycle."""
+
+    def test_one_level_per_minute_on_the_stage_scale(self):
+        for profile, seed in NIGHTS:
+            with self.subTest(profile=profile, seed=seed):
+                result = analyze(night(profile, seed)[0])
+                depth, minutes = result["depth"], result["minutes"]
+                self.assertEqual(len(depth), len(minutes))
+                for level, m in zip(depth, minutes):
+                    if m["t"] < result["onset"] or m["awake"]:
+                        self.assertEqual(level, STAGE_LEVEL["awake"])
+                    elif level is not None:
+                        self.assertTrue(STAGE_LEVEL["deep"] <= level <= STAGE_LEVEL["awake"])
+                        if m["light"]:
+                            self.assertGreaterEqual(level, STAGE_LEVEL["light"])
+
+    def test_quiet_deep_sleep_sits_at_the_bottom(self):
+        rows, events = night()
+        result = analyze(rows)
+        start, end = quiet_deep_stretch(events, 30)
+        levels = [d for d, m in zip(result["depth"], result["minutes"]) if start + 300 <= m["t"] < end - 300]
+        self.assertTrue(levels)
+        self.assertLess(max(levels), STAGE_LEVEL["light"])
+        awake = [d for d, m in zip(result["depth"], result["minutes"]) if m["awake"]]
+        self.assertTrue(awake and all(d == STAGE_LEVEL["awake"] for d in awake))
+
+    def test_turning_over_shows_as_lighter_than_the_minutes_around_it(self):
+        turnover = alarm_unix_for_night(DATE, "03:10", [])
+        rows, _ = night(turnover_at=turnover)
+        result = analyze(rows)
+        by_t = dict(zip((m["t"] for m in result["minutes"]), result["depth"]))
+        minute = turnover - turnover % 60
+        before = [by_t[minute - 60 * i] for i in range(10, 20)]
+        self.assertGreaterEqual(by_t[minute], STAGE_LEVEL["light"])
+        self.assertGreater(by_t[minute], sum(before) / len(before))
+
+    def test_no_signal_is_no_level(self):
+        # a Detector-only night: still rows with no heart rate have movement but no resting heart rate
+        start = 1791879960
+        rows = [still_row(start + 10 * i, hr=None) for i in range(60 * 6)]
+        rows = [r._replace(hr_conf=0.0) for r in rows]
+        result = analyze(rows)
+        self.assertIsNotNone(result["onset"])
+        asleep = [d for d, m in zip(result["depth"], result["minutes"]) if m["t"] >= result["onset"]]
+        self.assertTrue(asleep and all(d == 0.0 for d in asleep))  # movement alone, all of it resting
+        empty = analyze([r._replace(samples=0, mov_sum=0.0) for r in rows])
+        self.assertTrue(all(d in (None, STAGE_LEVEL["awake"]) for d in empty["depth"]))
+
+    def test_expected_cycles_tile_the_night(self):
+        onset, end = 1791874320, 1791874320 + 7 * 3600 + 15 * 60
+        cycles = expected_cycles(onset, end, 90)
+        self.assertEqual(cycles[0][0], onset)
+        self.assertEqual(cycles[-1][1], end)
+        for (_, stop, _), (start, _, _) in zip(cycles, cycles[1:]):
+            self.assertEqual(stop, start)
+        self.assertTrue(all(stage in STAGE_LEVEL and stage != "awake" for _, _, stage in cycles))
+        minutes = lambda index, stage: sum(  # noqa: E731
+            (min(e, onset + (index + 1) * 5400) - max(s, onset + index * 5400)) // 60
+            for s, e, st in cycles if st == stage and s < onset + (index + 1) * 5400 and e > onset + index * 5400)
+        self.assertGreater(minutes(0, "deep"), minutes(3, "deep"))  # deep sleep early, REM late
+        self.assertGreater(minutes(3, "rem"), minutes(0, "rem"))
+        self.assertEqual(expected_cycles(None, end, 90), [])
+        self.assertEqual(expected_cycles(onset, onset, 90), [])
+
+    def test_cycle_length_is_tunable_and_bounded(self):
+        rows, _ = night()
+        result = analyze(rows, {"cycle_minutes": 100})
+        self.assertEqual(result["cycle_minutes"], 100)
+        starts = sorted({s for s, _, _ in result["expected_cycles"]})
+        self.assertEqual(starts[0], result["onset"])
+        self.assertIn(result["onset"] + 100 * 60, starts)
+        self.assertNotIn(result["onset"] + 90 * 60, starts)
+        self.assertEqual(tuning_from_settings({"tuning": {"cycle_minutes": 5}})["cycle_minutes"], 90)
+        self.assertEqual(tuning_from_settings({"tuning": {"depth_smooth_minutes": 0}})["depth_smooth_minutes"], 5)
 
 
 class DetectorTests(unittest.TestCase):

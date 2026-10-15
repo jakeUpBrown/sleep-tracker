@@ -17,7 +17,7 @@ from datetime import datetime, timedelta
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
-from analysis.sleep_analysis import Row, alarm_unix_for_night  # noqa: E402
+from analysis.sleep_analysis import Row, alarm_unix_for_night, cycle_stages  # noqa: E402
 
 HEADER = "time,watch_unix,samples,mov_sum,mov_max,ax,ay,az,hr,hr_conf,battery,pi_unix"
 
@@ -57,26 +57,6 @@ def _overlay(stages: list, start: int, end: int, stage: str) -> list:
     return sorted(out)
 
 
-def _cycle_stages(start: int, end: int, index: int) -> list:
-    # Deep sleep dominates early cycles, REM the later ones
-    deep = max(0.0, 0.40 - 0.12 * index)
-    rem = min(0.45, 0.12 + 0.08 * index)
-    light = 1.0 - deep - rem
-    out = []
-    t = start
-    for stage, share in (("light", light * 0.6), ("deep", deep), ("light", light * 0.4), ("rem", rem)):
-        length = int((end - start) * share)
-        if length < 60:
-            continue
-        if out and out[-1][2] == stage:
-            out[-1][1] += length
-        else:
-            out.append([t, t + length, stage])
-        t += length
-    out[-1][1] = end
-    return out
-
-
 def _random_time_in(rng: random.Random, stages: list, stage: str, margin: int, earliest: int) -> int | None:
     spans = [(max(s, earliest), e) for s, e, st in stages if st == stage]
     spans = [(s, e) for s, e in spans if e - s > 2 * margin]
@@ -104,7 +84,7 @@ def plan_night(date: str, rng: random.Random, profile: str) -> dict:
         start = stop
     stages = [[in_bed, onset, "awake"]]
     for i, (a, b) in enumerate(cycles):
-        stages += _cycle_stages(a, b, i)
+        stages += cycle_stages(a, b, i)
     stages.append([final_wake, end, "awake"])
 
     boundaries = [c[0] for c in cycles[1:]]

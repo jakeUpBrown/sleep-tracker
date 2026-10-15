@@ -8,7 +8,7 @@
 <link rel="icon" href="/icon.svg">
 <title>Sleep Tracker</title>
 <style>
-  :root { --bg:#11131a; --card:#1b1e28; --line:#2c3040; --text:#e8e9ee; --dim:#9a9fb0; --accent:#f2c46d; --hr:#e57373; --mov:#7fa7e8; --act:#c39bf0; }
+  :root { --bg:#11131a; --card:#1b1e28; --line:#2c3040; --text:#e8e9ee; --dim:#9a9fb0; --accent:#f2c46d; --hr:#e57373; --mov:#7fa7e8; --act:#c39bf0; --cycle:#6fc3a0; }
   * { box-sizing:border-box; }
   body { margin:0; background:var(--bg); color:var(--text); font:16px/1.4 system-ui, sans-serif; padding:16px 16px 40px; }
   h1 { font-size:20px; margin:4px 0 16px; }
@@ -34,6 +34,8 @@
   .stat { background:var(--bg); border-radius:10px; padding:8px; text-align:center; }
   .stat b { display:block; font-size:18px; }
   canvas { width:100%; height:280px; display:block; }
+  canvas#depth { height:220px; }
+  h3 { font-size:14px; margin:18px 0 6px; color:var(--dim); font-weight:600; }
   .legend { display:flex; flex-wrap:wrap; gap:4px 16px; font-size:13px; color:var(--dim); margin-top:6px; }
   .dot { display:inline-block; width:10px; height:10px; border-radius:2px; margin-right:5px; vertical-align:-1px; }
   .dot.light { background:rgba(242,196,109,.22); }
@@ -105,15 +107,23 @@
       <div class="stat"><b id="sHr">–</b><span class="muted">avg bpm</span></div>
       <div class="stat"><b id="sLow">–</b><span class="muted">lowest bpm</span></div>
     </div>
+    <h3>Sleep depth</h3>
+    <canvas id="depth"></canvas>
+    <div class="legend">
+      <span><span class="line" style="border-color:var(--mov)"></span>Measured depth</span>
+      <span><span class="line dash" style="border-color:var(--cycle)"></span>Typical cycle</span>
+      <span><span class="line dash"></span>Fell asleep / woke</span>
+      <span><span class="line" style="border-color:var(--accent)"></span>Fade (current settings)</span>
+      <span id="legAct" hidden><span class="line" style="border-color:var(--act)"></span>What the alarm did</span>
+    </div>
+    <p class="muted" id="depthNote"></p>
+    <h3>Movement and heart rate</h3>
     <canvas id="chart"></canvas>
     <div class="legend">
       <span><span class="dot" style="background:var(--mov)"></span>Movement</span>
       <span><span class="dot" style="background:var(--hr)"></span>Heart rate</span>
       <span><span class="dot light"></span>Light sleep</span>
       <span><span class="dot awake"></span>Awake</span>
-      <span><span class="line dash"></span>Fell asleep / woke</span>
-      <span><span class="line" style="border-color:var(--accent)"></span>Fade (current settings)</span>
-      <span id="legAct" hidden><span class="line" style="border-color:var(--act)"></span>What the alarm did</span>
     </div>
     <p class="story" id="story"></p>
   </div>
@@ -238,7 +248,9 @@ async function showNight(date) {
   $("sHr").textContent = n.hr_avg ?? "–";
   $("sLow").textContent = n.hr_min ?? "–";
   $("detail").hidden = false;
+  drawDepth(d);
   drawChart(d);
+  $("depthNote").textContent = depthNote(a);
   $("story").textContent = story(d, n);
   fillDiary(date, d.diary);
 }
@@ -295,6 +307,12 @@ function simulationLine(s, used, n, live) {
   return used.enabled ? cap(text) : `If the alarm were on, ${text}`;
 }
 
+function depthNote(a) {
+  const how = "Depth is how far movement and heart rate sit above their resting levels, averaged over a few minutes: an index, not a sleep stage.";
+  if (a.onset == null) return `${how} Awake until a sleep onset is found.`;
+  return `${how} The dashed line is a textbook ${a.cycle_minutes}-minute cycle from when you fell asleep, to compare against; real cycles vary and wrist data can't tell REM from deep sleep.`;
+}
+
 function story(d, n) {
   const a = d.analysis || {}, parts = [];
   if (a.onset != null) {
@@ -314,41 +332,136 @@ function story(d, n) {
   return parts.join(" ");
 }
 
-function drawChart(night) {
-  const rows = night.minutes;
-  const cv = $("chart"), dpr = window.devicePixelRatio || 1;
+const L = 44, R = 8; // chart margins, the same on both charts so their time axes line up
+const STAGES = ["Deep", "Light", "REM", "Awake"]; // the depth chart's levels, bottom to top (STAGE_LEVEL in sleep_analysis.py)
+const css = getComputedStyle(document.documentElement);
+const col = n => css.getPropertyValue(n).trim();
+
+function setupCanvas(cv) {
+  const dpr = window.devicePixelRatio || 1;
   const W = cv.clientWidth, H = cv.clientHeight;
   cv.width = W * dpr; cv.height = H * dpr;
   const g = cv.getContext("2d"); g.scale(dpr, dpr); g.clearRect(0, 0, W, H);
+  g.font = "11px system-ui";
+  return { g, W, H };
+}
+
+function timeScale(rows, W) {
+  const t0 = rows[0].t, t1 = Math.max(rows[rows.length - 1].t, t0 + 60);
+  const x = t => L + (t - t0) / (t1 - t0) * (W - L - R);
+  return { t0, t1, x, xc: t => Math.max(L, Math.min(W, x(t))) };
+}
+
+// the moments both charts mark with a vertical line; the depth chart carries the labels
+function nightEvents(night, sc) {
+  const a = night.analysis || {}, s = night.simulation, act = actualTimes(night.actual), events = [];
+  const add = (t, color, dashed, label) => {
+    if (t != null && t >= sc.t0 && t <= sc.t1 + 60) events.push({ t, px: Math.round(sc.x(t)) + 0.5, color, dashed, label });
+  };
+  add(a.onset, col("--text"), true, "asleep");
+  if (a.onset != null) add(a.final_wake, col("--text"), true, "awake"); // awake all along isn't a wake-up
+  if (s) add(s.fade_start, col("--accent"), false, "fade");
+  if (act) {
+    add(act.fade, col("--act"), false, act.fadeFailed ? "fade failed" : "faded");
+    add(act.buzz, col("--act"), false, "buzz");
+    add(act.awake, col("--act"), false, "button");
+  }
+  return events;
+}
+
+function drawEventLines(g, events, top, bottom) {
+  for (const e of events) {
+    g.strokeStyle = e.color; g.lineWidth = e.dashed ? 1 : 1.5; g.setLineDash(e.dashed ? [4, 3] : []);
+    g.beginPath(); g.moveTo(e.px, top); g.lineTo(e.px, bottom); g.stroke();
+  }
+  g.setLineDash([]);
+}
+
+// the fade band along the top of the plot, with the current settings
+function drawFadeBand(g, s, sc, top) {
+  if (!s || s.fade_end <= sc.t0 || s.fade_start > sc.t1 + 60) return;
+  g.fillStyle = col("--accent");
+  g.fillRect(sc.xc(s.fade_start), top, Math.max(2, sc.xc(s.fade_end) - sc.xc(s.fade_start)), 4);
+}
+
+function drawHours(g, sc, H) {
+  g.fillStyle = col("--dim"); g.textAlign = "center";
+  const hours = (sc.t1 - sc.t0) / 3600, step = hours > 8 ? 2 : 1;
+  const first = new Date(sc.t0 * 1000); first.setMinutes(0, 0, 0); first.setHours(first.getHours() + 1);
+  for (let d = first; d / 1000 <= sc.t1; d = new Date(+d + step * 3600000)) {
+    const h = d.getHours();
+    g.fillText(`${h % 12 || 12}${h < 12 ? "a" : "p"}`, sc.x(d / 1000), H - 6);
+  }
+}
+
+// Sleep depth through the night: the measured depth index against a textbook sleep cycle
+function drawDepth(night) {
+  const rows = night.minutes, { g, W, H } = setupCanvas($("depth"));
+  if (!rows.length) return;
+  const sc = timeScale(rows, W), a = night.analysis || {};
+  const events = nightEvents(night, sc);
+  const labels = placeLabels(g, events, W);
+  const strip = 12 * labels.reduce((n, l) => Math.max(n, l.row + 1), 0);
+  const top = 6 + strip, bottom = H - 22, plotH = bottom - top;
+  const y = level => bottom - level / (STAGES.length - 1) * plotH;
+
+  g.textAlign = "right"; g.fillStyle = col("--dim"); g.strokeStyle = col("--line"); g.lineWidth = 1;
+  STAGES.forEach((name, level) => {
+    g.beginPath(); g.moveTo(L, y(level)); g.lineTo(W - R, y(level)); g.stroke();
+    g.fillText(name, L - 5, y(level) + 4);
+  });
+
+  // the textbook cycle from sleep onset, a dashed step line
+  const cycles = a.expected_cycles || [];
+  if (cycles.length) {
+    g.strokeStyle = col("--cycle"); g.lineWidth = 1.5; g.setLineDash([5, 4]); g.beginPath();
+    cycles.forEach(([from, to, stage], i) => {
+      const yy = y(STAGES.findIndex(s => s.toLowerCase() === stage));
+      if (i) g.lineTo(sc.xc(from), yy); else g.moveTo(sc.xc(from), yy);
+      g.lineTo(sc.xc(to), yy);
+    });
+    g.stroke(); g.setLineDash([]);
+  }
+
+  // measured depth: a line with the area down to deep sleep filled, broken where data is missing
+  const runs = [];
+  let run = [];
+  for (const r of rows) {
+    const p = r.depth == null ? null : { x: sc.x(r.t), y: y(r.depth), t: r.t };
+    if (p && (!run.length || p.t - run[run.length - 1].t <= 300)) { run.push(p); continue; }
+    if (run.length) runs.push(run);
+    run = p ? [p] : [];
+  }
+  if (run.length) runs.push(run);
+  for (const pts of runs) {
+    const last = pts[pts.length - 1];
+    g.fillStyle = col("--mov"); g.globalAlpha = 0.22; g.beginPath();
+    g.moveTo(pts[0].x, bottom);
+    for (const p of pts) g.lineTo(p.x, p.y);
+    g.lineTo(last.x + 1, last.y); g.lineTo(last.x + 1, bottom); g.closePath(); g.fill();
+    g.globalAlpha = 1; g.strokeStyle = col("--mov"); g.lineWidth = 1.5; g.beginPath();
+    pts.forEach((p, i) => i ? g.lineTo(p.x, p.y) : g.moveTo(p.x, p.y));
+    g.lineTo(last.x + 1, last.y); g.stroke();
+  }
+
+  drawFadeBand(g, night.simulation, sc, top);
+  drawEventLines(g, events, top, bottom);
+  drawHours(g, sc, H);
+  g.textAlign = "left";
+  for (const l of labels) { g.fillStyle = l.color; g.fillText(l.label, l.left, 12 * l.row + 12); }
+}
+
+// Movement bars and the heart rate line, with the light and awake stretches shaded
+function drawChart(night) {
+  const rows = night.minutes, { g, W, H } = setupCanvas($("chart"));
   const act = actualTimes(night.actual);
   $("legAct").hidden = !act;
   if (!rows.length) return;
-  const css = getComputedStyle(document.documentElement);
-  const col = n => css.getPropertyValue(n).trim();
-  const L = 34, R = 8;
-  const t0 = rows[0].t, t1 = Math.max(rows[rows.length - 1].t, t0 + 60);
-  const x = t => L + (t - t0) / (t1 - t0) * (W - L - R);
-  const xc = t => Math.max(L, Math.min(W, x(t)));
+  const sc = timeScale(rows, W), { t0, t1, x, xc } = sc;
   const barW = Math.max(1, (W - L - R) / ((t1 - t0) / 60) - 0.5);
-  const a = night.analysis || {}, s = night.simulation;
-
-  // event lines, labelled in a strip above the movement area that is as tall as the labels need
-  const events = [];
-  const addEvent = (t, color, dashed, label) => {
-    if (t != null && t >= t0 && t <= t1 + 60) events.push({ t, px: Math.round(x(t)) + 0.5, color, dashed, label });
-  };
-  addEvent(a.onset, col("--text"), true, "asleep");
-  if (a.onset != null) addEvent(a.final_wake, col("--text"), true, "awake"); // awake all along isn't a wake-up
-  if (s) addEvent(s.fade_start, col("--accent"), false, "fade");
-  if (act) {
-    addEvent(act.fade, col("--act"), false, act.fadeFailed ? "fade failed" : "faded");
-    addEvent(act.buzz, col("--act"), false, "buzz");
-    addEvent(act.awake, col("--act"), false, "button");
-  }
-  g.font = "11px system-ui";
-  const labels = placeLabels(g, events, W);
-  const strip = 12 * labels.reduce((n, l) => Math.max(n, l.row + 1), 0);
-  const top = 6 + strip, movH = (H - 30 - strip) * 0.4, gap = 12, hrTop = top + movH + gap, hrH = H - 24 - hrTop;
+  const a = night.analysis || {};
+  const events = nightEvents(night, sc);
+  const top = 6, movH = (H - 30) * 0.4, gap = 12, hrTop = top + movH + gap, hrH = H - 24 - hrTop;
 
   // light sleep and awake stretches, behind the movement bars
   const shade = (spans, color, alpha) => {
@@ -369,27 +482,19 @@ function drawChart(night) {
     g.fillRect(x(r.t), top + movH - h, barW, h);
   }
 
-  // the fade band along the top of the movement area, then the event lines
-  if (s && s.fade_end > t0 && s.fade_start <= t1 + 60) {
-    g.fillStyle = col("--accent");
-    g.fillRect(xc(s.fade_start), top, Math.max(2, xc(s.fade_end) - xc(s.fade_start)), 4);
-  }
-  for (const e of events) {
-    g.strokeStyle = e.color; g.lineWidth = e.dashed ? 1 : 1.5; g.setLineDash(e.dashed ? [4, 3] : []);
-    g.beginPath(); g.moveTo(e.px, top); g.lineTo(e.px, hrTop + hrH); g.stroke();
-  }
-  g.setLineDash([]);
+  drawFadeBand(g, night.simulation, sc, top);
+  drawEventLines(g, events, top, hrTop + hrH);
 
   // heart rate line
   const hrs = rows.filter(r => r.hr != null).map(r => r.hr);
-  g.font = "11px system-ui"; g.fillStyle = col("--dim"); g.textAlign = "right";
+  g.fillStyle = col("--dim"); g.textAlign = "right";
   if (hrs.length) {
     const lo = Math.floor((Math.min(...hrs) - 3) / 5) * 5, hi = Math.ceil((Math.max(...hrs) + 3) / 5) * 5;
     const y = v => hrTop + hrH - (v - lo) / (hi - lo) * hrH;
     g.strokeStyle = col("--line"); g.lineWidth = 1;
     for (const v of [lo, Math.round((lo + hi) / 2), hi]) {
       g.beginPath(); g.moveTo(L, y(v)); g.lineTo(W - R, y(v)); g.stroke();
-      g.fillText(v, L - 4, y(v) + 4);
+      g.fillText(v, L - 5, y(v) + 4);
     }
     g.strokeStyle = col("--hr"); g.lineWidth = 1.5; g.beginPath();
     let prev = null;
@@ -405,17 +510,7 @@ function drawChart(night) {
     g.textAlign = "left"; g.fillText("No confident heart rate readings", L, hrTop + hrH / 2);
   }
 
-  // hour labels
-  g.fillStyle = col("--dim"); g.textAlign = "center";
-  const hours = (t1 - t0) / 3600, step = hours > 8 ? 2 : 1;
-  const first = new Date(t0 * 1000); first.setMinutes(0, 0, 0); first.setHours(first.getHours() + 1);
-  for (let d = first; d / 1000 <= t1; d = new Date(+d + step * 3600000)) {
-    const h = d.getHours();
-    g.fillText(`${h % 12 || 12}${h < 12 ? "a" : "p"}`, x(d / 1000), H - 6);
-  }
-
-  g.textAlign = "left";
-  for (const l of labels) { g.fillStyle = l.color; g.fillText(l.label, l.left, 12 * l.row + 12); }
+  drawHours(g, sc, H);
 }
 
 // Labels for lines a few pixels apart in the same colour are merged ("buzz + button"). Each label
@@ -524,7 +619,7 @@ $("dSave").onclick = saveDiary;
 $("enabled").onchange = $("alarm").oninput = $("window").onchange = $("fade").onchange = updateSummary;
 $("save").onclick = saveSettings;
 $("night").onchange = e => showNight(e.target.value);
-window.addEventListener("resize", () => current && drawChart(current));
+window.addEventListener("resize", () => { if (current) { drawDepth(current); drawChart(current); } });
 loadSettings();
 loadNights();
 setInterval(loadNights, 60000);
