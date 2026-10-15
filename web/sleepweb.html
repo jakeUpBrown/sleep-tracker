@@ -1,0 +1,225 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<meta name="theme-color" content="#11131a">
+<link rel="manifest" href="/manifest.webmanifest">
+<link rel="icon" href="/icon.svg">
+<title>Sleep Tracker</title>
+<style>
+  :root { --bg:#11131a; --card:#1b1e28; --line:#2c3040; --text:#e8e9ee; --dim:#9a9fb0; --accent:#f2c46d; --hr:#e57373; --mov:#7fa7e8; }
+  * { box-sizing:border-box; }
+  body { margin:0; background:var(--bg); color:var(--text); font:16px/1.4 system-ui, sans-serif; padding:16px 16px 40px; }
+  h1 { font-size:20px; margin:4px 0 16px; }
+  h2 { font-size:15px; margin:0 0 12px; color:var(--dim); font-weight:600; text-transform:uppercase; letter-spacing:.04em; }
+  .card { background:var(--card); border-radius:14px; padding:16px; margin-bottom:16px; max-width:640px; }
+  .row { display:flex; align-items:center; justify-content:space-between; gap:12px; margin:10px 0; }
+  label { color:var(--dim); }
+  input[type=time], select { background:var(--bg); color:var(--text); border:1px solid var(--line); border-radius:10px; font-size:20px; padding:8px 10px; }
+  select.small { font-size:16px; }
+  button { background:var(--accent); color:#1a1a1a; border:0; border-radius:10px; font-size:17px; font-weight:600; padding:12px; width:100%; margin-top:8px; }
+  button:disabled { opacity:.5; }
+  .summary { font-size:18px; margin:4px 0 8px; }
+  .muted { color:var(--dim); font-size:14px; }
+  .switch { position:relative; width:52px; height:30px; }
+  .switch input { opacity:0; width:0; height:0; }
+  .slider { position:absolute; inset:0; background:var(--line); border-radius:30px; transition:.2s; }
+  .slider:before { content:""; position:absolute; width:24px; height:24px; left:3px; top:3px; background:#fff; border-radius:50%; transition:.2s; }
+  .switch input:checked + .slider { background:var(--accent); }
+  .switch input:checked + .slider:before { transform:translateX(22px); }
+  .stats { display:grid; grid-template-columns:repeat(3, 1fr); gap:8px; margin:12px 0; }
+  .stat { background:var(--bg); border-radius:10px; padding:8px; text-align:center; }
+  .stat b { display:block; font-size:18px; }
+  canvas { width:100%; height:260px; display:block; }
+  .legend { display:flex; gap:16px; font-size:13px; color:var(--dim); margin-top:6px; }
+  .dot { display:inline-block; width:10px; height:10px; border-radius:2px; margin-right:5px; vertical-align:-1px; }
+  .live { color:#8bd48b; }
+  .stale { color:var(--dim); }
+</style>
+</head>
+<body>
+<h1>Sleep Tracker</h1>
+
+<div class="card">
+  <h2>Alarm</h2>
+  <div class="row">
+    <label for="enabled">Smart alarm on</label>
+    <label class="switch"><input type="checkbox" id="enabled"><span class="slider"></span></label>
+  </div>
+  <div class="row">
+    <label for="alarm">Wake up by</label>
+    <input type="time" id="alarm" value="06:30">
+  </div>
+  <div class="row">
+    <label for="window">Smart wake window</label>
+    <select id="window">
+      <option value="0">Off (exact time)</option>
+      <option value="15">15 min</option>
+      <option value="20">20 min</option>
+      <option value="30">30 min</option>
+      <option value="45">45 min</option>
+      <option value="60">60 min</option>
+    </select>
+  </div>
+  <div class="summary" id="summary"></div>
+  <button id="save">Save</button>
+  <div class="muted" id="saved"></div>
+</div>
+
+<div class="card">
+  <h2>Sleep</h2>
+  <div class="muted" id="status">Loading…</div>
+  <div class="row" id="pickrow" hidden>
+    <label for="night">Night of</label>
+    <select id="night" class="small"></select>
+  </div>
+  <div id="detail" hidden>
+    <div class="stats">
+      <div class="stat"><b id="sDur">–</b><span class="muted">recorded</span></div>
+      <div class="stat"><b id="sHr">–</b><span class="muted">avg bpm</span></div>
+      <div class="stat"><b id="sLow">–</b><span class="muted">lowest bpm</span></div>
+    </div>
+    <canvas id="chart"></canvas>
+    <div class="legend">
+      <span><span class="dot" style="background:var(--mov)"></span>Movement</span>
+      <span><span class="dot" style="background:var(--hr)"></span>Heart rate</span>
+    </div>
+  </div>
+</div>
+
+<script>
+const $ = id => document.getElementById(id);
+const clock = d => d.toLocaleTimeString([], { hour: "numeric", minute: "2-digit" });
+const hhmmToDate = s => { const [h, m] = s.split(":").map(Number); const d = new Date(); d.setHours(h, m, 0, 0); return d; };
+const ago = s => s < 90 ? "just now" : s < 5400 ? `${Math.round(s / 60)} min ago` : s < 172800 ? `${Math.round(s / 3600)} h ago` : `${Math.round(s / 86400)} days ago`;
+
+function updateSummary() {
+  if (!$("enabled").checked) { $("summary").textContent = "Alarm is off."; return; }
+  const end = hhmmToDate($("alarm").value || "06:30");
+  const win = Number($("window").value);
+  const start = new Date(end - win * 60000);
+  $("summary").textContent = win ? `Wakes you between ${clock(start)} and ${clock(end)}.` : `Wakes you at ${clock(end)}.`;
+}
+
+async function loadSettings() {
+  const s = await (await fetch("/api/settings")).json();
+  $("enabled").checked = s.enabled;
+  $("alarm").value = s.alarm_time;
+  const w = $("window");
+  if (![...w.options].some(o => Number(o.value) === s.window_minutes)) w.add(new Option(`${s.window_minutes} min`, s.window_minutes));
+  w.value = String(s.window_minutes);
+  updateSummary();
+}
+
+async function saveSettings() {
+  $("save").disabled = true;
+  try {
+    const r = await fetch("/api/settings", {
+      method: "POST", headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ enabled: $("enabled").checked, alarm_time: $("alarm").value, window_minutes: Number($("window").value) }),
+    });
+    const s = await r.json();
+    $("saved").textContent = r.ok ? `Saved at ${clock(new Date())}.` : `Not saved: ${s.error}`;
+  } catch { $("saved").textContent = "Not saved: can't reach the Pi."; }
+  $("save").disabled = false;
+}
+
+let nights = [];
+async function loadNights() {
+  const data = await (await fetch("/api/nights")).json();
+  nights = data.nights;
+  if (!nights.length) { $("status").textContent = "No nights recorded yet."; return; }
+  const latest = nights[0], since = data.now - latest.last_received;
+  $("status").innerHTML = since < 300
+    ? `<span class="live">● Recording now</span> (last data ${ago(since)})`
+    : `<span class="stale">Not recording. Last data ${ago(since)}.</span>`;
+  const keep = $("night").value;
+  $("night").innerHTML = "";
+  for (const n of nights) {
+    const d = new Date(n.date + "T12:00:00");
+    $("night").add(new Option(d.toLocaleDateString([], { weekday: "short", month: "short", day: "numeric" }), n.date));
+  }
+  $("pickrow").hidden = false;
+  const pick = nights.some(n => n.date === keep) ? keep : nights[0].date;
+  $("night").value = pick;
+  showNight(pick);
+}
+
+async function showNight(date) {
+  const n = nights.find(x => x.date === date);
+  const mins = Math.round((n.end - n.start) / 60);
+  $("sDur").textContent = `${Math.floor(mins / 60)}h ${String(mins % 60).padStart(2, "0")}m`;
+  $("sHr").textContent = n.hr_avg ?? "–";
+  $("sLow").textContent = n.hr_min ?? "–";
+  $("detail").hidden = false;
+  drawChart((await (await fetch(`/api/night?date=${date}`)).json()).minutes);
+}
+
+function drawChart(rows) {
+  const cv = $("chart"), dpr = window.devicePixelRatio || 1;
+  const W = cv.clientWidth, H = cv.clientHeight;
+  cv.width = W * dpr; cv.height = H * dpr;
+  const g = cv.getContext("2d"); g.scale(dpr, dpr); g.clearRect(0, 0, W, H);
+  if (!rows.length) return;
+  const css = getComputedStyle(document.documentElement);
+  const col = n => css.getPropertyValue(n).trim();
+  const L = 34, R = 8, top = 6, movH = (H - 30) * 0.4, gap = 12, hrTop = top + movH + gap, hrH = H - 24 - hrTop;
+  const t0 = rows[0].t, t1 = Math.max(rows[rows.length - 1].t, t0 + 60);
+  const x = t => L + (t - t0) / (t1 - t0) * (W - L - R);
+  const barW = Math.max(1, (W - L - R) / ((t1 - t0) / 60) - 0.5);
+
+  // movement bars, scaled to the 98th percentile so one big toss doesn't flatten the rest
+  const movs = rows.map(r => r.mov).sort((a, b) => a - b);
+  const movMax = movs[Math.floor(movs.length * 0.98)] || movs[movs.length - 1] || 1;
+  g.fillStyle = col("--mov");
+  for (const r of rows) {
+    const h = Math.min(1, r.mov / movMax) * movH;
+    g.fillRect(x(r.t), top + movH - h, barW, h);
+  }
+
+  // heart rate line
+  const hrs = rows.filter(r => r.hr != null).map(r => r.hr);
+  g.font = "11px system-ui"; g.fillStyle = col("--dim"); g.textAlign = "right";
+  if (hrs.length) {
+    const lo = Math.floor((Math.min(...hrs) - 3) / 5) * 5, hi = Math.ceil((Math.max(...hrs) + 3) / 5) * 5;
+    const y = v => hrTop + hrH - (v - lo) / (hi - lo) * hrH;
+    g.strokeStyle = col("--line"); g.lineWidth = 1;
+    for (const v of [lo, Math.round((lo + hi) / 2), hi]) {
+      g.beginPath(); g.moveTo(L, y(v)); g.lineTo(W - R, y(v)); g.stroke();
+      g.fillText(v, L - 4, y(v) + 4);
+    }
+    g.strokeStyle = col("--hr"); g.lineWidth = 1.5; g.beginPath();
+    let prev = null;
+    for (const r of rows) {
+      if (r.hr == null) { prev = null; continue; }
+      if (prev && r.t - prev > 300) g.moveTo(x(r.t), y(r.hr)); // gap in readings
+      else if (prev) g.lineTo(x(r.t), y(r.hr));
+      else g.moveTo(x(r.t), y(r.hr));
+      prev = r.t;
+    }
+    g.stroke();
+  } else {
+    g.textAlign = "left"; g.fillText("No confident heart rate readings", L, hrTop + hrH / 2);
+  }
+
+  // hour labels
+  g.fillStyle = col("--dim"); g.textAlign = "center";
+  const hours = (t1 - t0) / 3600, step = hours > 8 ? 2 : 1;
+  const first = new Date(t0 * 1000); first.setMinutes(0, 0, 0); first.setHours(first.getHours() + 1);
+  for (let d = first; d / 1000 <= t1; d = new Date(+d + step * 3600000)) {
+    const h = d.getHours();
+    g.fillText(`${h % 12 || 12}${h < 12 ? "a" : "p"}`, x(d / 1000), H - 6);
+  }
+}
+
+$("enabled").onchange = $("alarm").oninput = $("window").onchange = updateSummary;
+$("save").onclick = saveSettings;
+$("night").onchange = e => showNight(e.target.value);
+window.addEventListener("resize", () => $("night").value && showNight($("night").value));
+loadSettings();
+loadNights();
+setInterval(loadNights, 60000);
+</script>
+</body>
+</html>

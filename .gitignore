@@ -1,0 +1,8 @@
+__pycache__/
+*.pyc
+.venv/
+# Personal data and device secrets live in ~/sleeptracker and ~ on the Pi, never in the repo
+*.csv
+settings.json
+snooz.json
+bangle.json
