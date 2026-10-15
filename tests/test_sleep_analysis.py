@@ -1,4 +1,5 @@
 import argparse
+import random
 import subprocess
 import sys
 import tempfile
@@ -213,6 +214,31 @@ class AnalyzeTests(unittest.TestCase):
         # the desk minutes and the minutes in bed before falling asleep count; the three hours between don't
         in_bed = (full["onset"] - rows[0].t) // 60 + 1
         self.assertLessEqual(with_test["asleep_minutes"], full["asleep_minutes"] + 15 + in_bed)
+
+    def test_real_watch_noise_floor_is_still(self):
+        # The first real night (Oct 2026): lying still reads about 2.0 per row, 12 per minute, all
+        # night long, with minutes of 20-100 at bedtime, one awakening and brief stirs. With the
+        # original floor of 10 every minute was active and the night had no onset at all.
+        start = 1791879960
+        rng = random.Random(4)
+        rows = []
+        for minute in range(8 * 60):
+            if minute < 12 or 240 <= minute < 255:
+                level = rng.uniform(4.0, 15.0)   # settling down, and an awakening
+            elif minute in (90, 150, 210, 330, 400):
+                level = rng.uniform(4.5, 5.5)    # a stir: 27-33 per minute
+            else:
+                level = rng.gauss(2.0, 0.1)
+            rows += [still_row(start + 60 * minute + 10 * i, mov=round(max(1.6, rng.gauss(level, 0.1)), 3))
+                     for i in range(6)]
+        result = analyze(rows)
+        by_t = {m["t"]: m for m in result["minutes"]}
+        self.assertEqual(result["onset"], start + 14 * 60)  # three still minutes after the last active one
+        self.assertTrue(by_t[start + 90 * 60]["active"])
+        self.assertFalse(by_t[start + 91 * 60]["active"])
+        self.assertEqual(result["awake_spans"][1:], [[start + 240 * 60, start + 257 * 60]])
+        self.assertEqual(result["asleep_minutes"], 8 * 60 - 14 - 17)  # minus settling down and the awakening
+        self.assertTrue(by_t[start + 330 * 60]["light"])
 
     def test_no_rows(self):
         result = analyze([])

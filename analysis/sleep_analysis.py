@@ -25,8 +25,10 @@ from typing import NamedTuple
 # in settings.json; tuning_from_settings() merges and checks the overrides.
 DEFAULT_TUNING = {
     "hr_min_confidence": 50,  # heart rate readings below this confidence (0-100) are ignored
-    "active_floor": 10.0,     # movement per minute that always counts as active
-    "active_ratio": 4.0,      # ...or more than this times the night's resting movement
+    # Lying still, the 12.5 Hz accelerometer's own noise adds up to about 12 per minute (first real
+    # night, Oct 2026: quiet half-hours never passed 14), so active starts well above that
+    "active_floor": 20.0,     # movement per minute that always counts as active
+    "active_ratio": 2.0,      # ...or more than this times the night's resting movement (its noise floor)
     "posture_degrees": 15.0,  # wrist angle change between minutes that counts as turning over
     "onset_minutes": 10,      # consecutive still minutes that mark falling asleep
     "awake_minutes": 3,       # active minutes within the last 5 that mean awake, not light sleep
@@ -202,7 +204,8 @@ def _header_columns(line: str) -> list[str] | None:
     return columns if "samples" in columns and "mov_sum" in columns else None
 
 
-def read_rows(path) -> list[Row]:
+def read_fields(path) -> list[tuple[Row, dict[str, str]]]:
+    """Each usable row with its column text as written, keyed by the header names in force."""
     rows = []
     header = None
     with open(path, encoding="utf-8", errors="replace", newline="") as f:
@@ -215,8 +218,12 @@ def read_rows(path) -> list[Row]:
                 continue
             row = parse_csv_line(line, header)
             if row is not None:
-                rows.append(row)
+                rows.append((row, dict(zip(header, line.strip().split(",")))))
     return rows
+
+
+def read_rows(path) -> list[Row]:
+    return [row for row, _ in read_fields(path)]
 
 
 # ---------- vectors ----------

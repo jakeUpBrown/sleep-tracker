@@ -29,8 +29,9 @@ PROFILES = {
 }
 # heart rate per stage: target range for a stretch, row-to-row jitter
 STAGE_HR = {"deep": (49, 53, 0.6), "light": (55, 58, 1.0), "rem": (60, 66, 3.0), "awake": (64, 72, 2.5)}
-# still-body movement per 10 s row: mean, noise, chance of a small twitch
-STAGE_MOV = {"deep": (0.85, 0.08, 0.0), "light": (1.1, 0.12, 0.015), "rem": (0.95, 0.12, 0.03)}
+# still-body movement per 10 s row: mean, noise, chance of a small twitch. The mean is mostly the
+# accelerometer's noise floor: a real still body reads about 2.0 per row (12 per minute)
+STAGE_MOV = {"deep": (1.95, 0.1, 0.0), "light": (2.15, 0.15, 0.015), "rem": (2.05, 0.15, 0.03)}
 # no random turnovers or brief awakenings this soon after falling asleep, so the planned onset
 # is the one the detector's still-minute rule can find
 SETTLE_SECONDS = 15 * 60

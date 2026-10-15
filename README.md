@@ -5,7 +5,7 @@ A DIY sleep tracker and smart alarm. A Bangle.js 2 watch records movement and he
 | Folder | Runs on | What it does |
 |---|---|---|
 | `snooz/` | Pi | Pair with the SNOOZ and control it: on, off, volume, fades |
-| `watch/` | Watch and Pi | **Pi Sleep Log** watch app (recording and the alarm screen), plus `watch_logger.py`, which saves its data on the Pi |
+| `watch/` | Watch and Pi | **Pi Sleep Log** watch app (recording and the alarm screen), plus `watch_logger.py`, which saves its data on the Pi, and `merge_pilog.py`, which fills a night the Pi missed from the watch's copy |
 | `analysis/` | Pi | `sleep_analysis.py`: finds sleep onset, light sleep and the moment to start the fade. Shared by the web app and the alarm so they always agree |
 | `wake/` | Pi | `wake.py`: the smart alarm service |
 | `web/` | Pi | Phone web app: alarm settings, sleep diary and sleep charts |
@@ -83,6 +83,25 @@ nohup ~/snooz-env/bin/python -u ~/sleeptracker/code/watch/watch_logger.py >> ~/s
 
 Each night goes to `~/sleeptracker/data/watch-YYYY-MM-DD.csv`, named for the evening it started. If the Pi missed part of the night, the watch keeps its own copy as `pilog.csv`, which you can download from the Web IDE's storage list (the drive icon).
 
+### Fill in a night the Pi missed
+
+If the logger stopped during the night, put the watch's copy back into that night's file:
+
+1. In the Web IDE, open the storage list (the drive icon), download `pilog.csv`, and copy it to the Pi:
+
+   ```bash
+   scp pilog.csv pi@<pi-address>:~/pilog.csv
+   ```
+
+2. On the Pi, see what would change, then do it:
+
+   ```bash
+   python3 ~/sleeptracker/code/watch/merge_pilog.py ~/pilog.csv --dry-run
+   python3 ~/sleeptracker/code/watch/merge_pilog.py ~/pilog.csv
+   ```
+
+   Rows are matched on the watch's timestamp, so running it twice is harmless. Each night that gains rows is rewritten with the original kept as `watch-YYYY-MM-DD.csv.bak`, and the report lists any stretch still without data: those are the watch's own gaps (on the charger, or recording switched off), which nothing can fill. Reload the web app to see the result. The watch keeps appending to `pilog.csv`, so delete it from the storage list now and then to keep it small.
+
 ### Smart alarm
 
 `wake.py` runs all the time as the `sleepwake` service and reads the settings you save in the web app. For a 6:30 AM alarm with a 30-minute window and a 15-minute fade:
@@ -154,7 +173,7 @@ To control it:
 {"enabled": true, "alarm_time": "06:30", "window_minutes": 30, "fade_minutes": 15, "updated": 1792025223}
 ```
 
-The light-sleep detection has a handful of thresholds with defaults listed at the top of `analysis/sleep_analysis.py`. To change one, add a `"tuning"` object to `settings.json`, for example `"tuning": {"active_ratio": 3.0}`; the web app keeps it when you save, and both the chart and the alarm use it. No nights had been recorded when the defaults were chosen, so expect to adjust them after a week of charts and diary entries.
+The light-sleep detection has a handful of thresholds with defaults listed at the top of `analysis/sleep_analysis.py`. To change one, add a `"tuning"` object to `settings.json`, for example `"tuning": {"active_ratio": 3.0}`; the web app keeps it when you save, and both the chart and the alarm use it. The movement thresholds were set from the first recorded night (October 2026); the rest had no real nights behind them yet, so expect to adjust them after a week of charts and diary entries.
 
 The night CSV columns are `time`, `watch_unix`, `samples`, `mov_sum`, `mov_max`, `ax`, `ay`, `az`, `hr`, `hr_conf`, `battery` and `pi_unix`. `mov_sum` is the movement signal. Ignore `hr` when `hr_conf` is low, and treat `battery` as a rough trend only.
 
