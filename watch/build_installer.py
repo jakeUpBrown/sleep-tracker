@@ -8,7 +8,7 @@ import json
 from pathlib import Path
 
 HERE = Path(__file__).parent
-VERSION = "0.4"  # bump when the watch app changes
+VERSION = "0.5"  # bump when the watch app changes
 FILES = ["pilog.boot.js", "pilog.app.js", "pilog.wid.js", "pilog.alarm.js"]
 INFO = {"id": "pilog", "name": "Pi Sleep Log", "src": "pilog.app.js", "icon": "pilog.img", "type": "app", "version": VERSION}
 

@@ -10,6 +10,7 @@ A DIY sleep tracker and smart alarm. A Bangle.js 2 watch records movement and he
 | `wake/` | Pi | `wake.py`: the smart alarm service |
 | `web/` | Pi | Phone web app: alarm settings, sleep diary and sleep charts |
 | `tests/` | Laptop | Unit tests, run with `python3 -m unittest discover -s tests` |
+| `docs/` | | `wake-prediction-research.md`: what the evidence says about timing a wake-up, which factors to add from the data already collected, and which new non-intrusive data is worth it |
 | `install.sh` | Pi | Installs or updates everything on the Pi |
 
 Not built yet: `sunrise.py` (LED light ramp).

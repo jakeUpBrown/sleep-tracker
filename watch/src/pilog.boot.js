@@ -18,8 +18,11 @@
   });
   if(!isOn()) return;
   global.PILOG=1;
-  // Keep the accelerometer at a steady 12.5 Hz so movement numbers are comparable all night
+  // Keep the accelerometer at a steady 12.5 Hz so movement numbers are comparable all night.
+  // powerSave:false stops the watch dropping to 800 ms polls, but doesn't undo a drop that already
+  // happened, so set the interval too (the samples column should read about 125 per row).
   try{Bangle.setOptions({powerSave:false});}catch(e){}
+  try{Bangle.setPollInterval(80);}catch(e){}
   var n=0,ms=0,mx=0,sx=0,sy=0,sz=0,hs=0,hn=0,hc=0;
   Bangle.on("accel",function(a){n++;ms+=a.diff;if(a.diff>mx)mx=a.diff;sx+=a.x;sy+=a.y;sz+=a.z;});
   Bangle.setHRMPower(1,"pilog");
