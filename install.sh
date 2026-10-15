@@ -47,10 +47,33 @@ sudo systemctl restart sleepweb
 sleep 2
 systemctl is-active --quiet sleepweb && echo "   running" || echo "   NOT running: check 'journalctl -u sleepweb -n 20'"
 
+echo "== Smart alarm service (wake.py)"
+sudo tee /etc/systemd/system/sleepwake.service > /dev/null <<SVC
+[Unit]
+Description=Sleep tracker smart alarm
+After=network-online.target bluetooth.target
+Wants=network-online.target
+
+[Service]
+User=$(id -un)
+ExecStart=$VENV/bin/python -u $REPO/wake/wake.py
+Restart=always
+RestartSec=10
+
+[Install]
+WantedBy=multi-user.target
+SVC
+sudo systemctl daemon-reload
+sudo systemctl enable --quiet sleepwake
+sudo systemctl restart sleepwake
+sleep 2
+systemctl is-active --quiet sleepwake && echo "   running" || echo "   NOT running: check 'journalctl -u sleepwake -n 20'"
+
 echo "$NEW" > "$STAMP"
 echo
 echo "Installed $(git -C "$REPO" log -1 --format='%h %s')"
 echo "Web app: http://$(hostname -I | awk '{print $1}'):8000"
+echo "Alarm:   $VENV/bin/python $REPO/wake/wake.py --status"
 
 if [ -n "$OLD" ] && [ "$OLD" != "$NEW" ]; then
   if changed watch/pilog_install.js; then

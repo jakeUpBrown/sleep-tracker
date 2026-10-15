@@ -8,19 +8,21 @@
 <link rel="icon" href="/icon.svg">
 <title>Sleep Tracker</title>
 <style>
-  :root { --bg:#11131a; --card:#1b1e28; --line:#2c3040; --text:#e8e9ee; --dim:#9a9fb0; --accent:#f2c46d; --hr:#e57373; --mov:#7fa7e8; }
+  :root { --bg:#11131a; --card:#1b1e28; --line:#2c3040; --text:#e8e9ee; --dim:#9a9fb0; --accent:#f2c46d; --hr:#e57373; --mov:#7fa7e8; --act:#c39bf0; }
   * { box-sizing:border-box; }
   body { margin:0; background:var(--bg); color:var(--text); font:16px/1.4 system-ui, sans-serif; padding:16px 16px 40px; }
   h1 { font-size:20px; margin:4px 0 16px; }
   h2 { font-size:15px; margin:0 0 12px; color:var(--dim); font-weight:600; text-transform:uppercase; letter-spacing:.04em; }
   .card { background:var(--card); border-radius:14px; padding:16px; margin-bottom:16px; max-width:640px; }
   .row { display:flex; align-items:center; justify-content:space-between; gap:12px; margin:10px 0; }
-  label { color:var(--dim); }
+  label, .label { color:var(--dim); }
+  .field { display:block; margin:14px 0 6px; }
   input[type=time], select { background:var(--bg); color:var(--text); border:1px solid var(--line); border-radius:10px; font-size:20px; padding:8px 10px; }
   select.small { font-size:16px; }
+  textarea { display:block; width:100%; min-height:76px; background:var(--bg); color:var(--text); border:1px solid var(--line); border-radius:10px; font:inherit; padding:8px 10px; resize:vertical; }
   button { background:var(--accent); color:#1a1a1a; border:0; border-radius:10px; font-size:17px; font-weight:600; padding:12px; width:100%; margin-top:8px; }
   button:disabled { opacity:.5; }
-  .summary { font-size:18px; margin:4px 0 8px; }
+  .summary { font-size:16px; margin:4px 0 8px; }
   .muted { color:var(--dim); font-size:14px; }
   .switch { position:relative; width:52px; height:30px; }
   .switch input { opacity:0; width:0; height:0; }
@@ -31,11 +33,24 @@
   .stats { display:grid; grid-template-columns:repeat(3, 1fr); gap:8px; margin:12px 0; }
   .stat { background:var(--bg); border-radius:10px; padding:8px; text-align:center; }
   .stat b { display:block; font-size:18px; }
-  canvas { width:100%; height:260px; display:block; }
-  .legend { display:flex; gap:16px; font-size:13px; color:var(--dim); margin-top:6px; }
+  canvas { width:100%; height:280px; display:block; }
+  .legend { display:flex; flex-wrap:wrap; gap:4px 16px; font-size:13px; color:var(--dim); margin-top:6px; }
   .dot { display:inline-block; width:10px; height:10px; border-radius:2px; margin-right:5px; vertical-align:-1px; }
+  .dot.light { background:rgba(242,196,109,.22); }
+  .dot.awake { background:rgba(154,159,176,.25); }
+  .line { display:inline-block; width:14px; border-top:2px solid var(--text); margin-right:5px; vertical-align:3px; }
+  .line.dash { border-top-style:dashed; }
+  .story { font-size:15px; margin:12px 0 0; }
   .live { color:#8bd48b; }
   .stale { color:var(--dim); }
+  .seg { display:flex; }
+  .seg button, .pills button { width:auto; margin:0; background:var(--bg); color:var(--text); border:1px solid var(--line); font-size:15px; }
+  .seg button { padding:8px 18px; }
+  .seg button:first-child { border-radius:10px 0 0 10px; }
+  .seg button:last-child { border-radius:0 10px 10px 0; border-left:0; }
+  .pills { display:grid; grid-template-columns:repeat(10, 1fr); gap:4px; }
+  .pills button { padding:8px 0; border-radius:999px; }
+  .seg button.on, .pills button.on { background:var(--accent); border-color:var(--accent); color:#1a1a1a; }
 </style>
 </head>
 <body>
@@ -62,6 +77,16 @@
       <option value="60">60 min</option>
     </select>
   </div>
+  <div class="row">
+    <label for="fade">Fade length</label>
+    <select id="fade">
+      <option value="5">5 min</option>
+      <option value="10">10 min</option>
+      <option value="15">15 min</option>
+      <option value="20">20 min</option>
+      <option value="30">30 min</option>
+    </select>
+  </div>
   <div class="summary" id="summary"></div>
   <button id="save">Save</button>
   <div class="muted" id="saved"></div>
@@ -76,7 +101,7 @@
   </div>
   <div id="detail" hidden>
     <div class="stats">
-      <div class="stat"><b id="sDur">–</b><span class="muted">recorded</span></div>
+      <div class="stat"><b id="sDur">–</b><span class="muted" id="sDurLabel">asleep</span></div>
       <div class="stat"><b id="sHr">–</b><span class="muted">avg bpm</span></div>
       <div class="stat"><b id="sLow">–</b><span class="muted">lowest bpm</span></div>
     </div>
@@ -84,31 +109,77 @@
     <div class="legend">
       <span><span class="dot" style="background:var(--mov)"></span>Movement</span>
       <span><span class="dot" style="background:var(--hr)"></span>Heart rate</span>
+      <span><span class="dot light"></span>Light sleep</span>
+      <span><span class="dot awake"></span>Awake</span>
+      <span><span class="line dash"></span>Fell asleep / woke</span>
+      <span><span class="line" style="border-color:var(--accent)"></span>Fade (current settings)</span>
+      <span id="legAct" hidden><span class="line" style="border-color:var(--act)"></span>What the alarm did</span>
     </div>
+    <p class="story" id="story"></p>
   </div>
+</div>
+
+<div class="card">
+  <h2>Diary</h2>
+  <div class="muted" id="dNight"></div>
+  <div class="row">
+    <span class="label">Melatonin</span>
+    <div class="seg" data-key="melatonin"><button type="button" data-v="true">Yes</button><button type="button" data-v="false">No</button></div>
+  </div>
+  <div class="row">
+    <span class="label">Sober</span>
+    <div class="seg" data-key="sober"><button type="button" data-v="true">Yes</button><button type="button" data-v="false">No</button></div>
+  </div>
+  <span class="label field">Sleep rating</span>
+  <div class="pills" id="rating"></div>
+  <label class="field" for="notes">Notes</label>
+  <textarea id="notes" maxlength="2000" placeholder="Woke at 3, took a while to fall back asleep…"></textarea>
+  <button id="dSave" disabled>Save</button>
+  <div class="muted" id="dSaved"></div>
 </div>
 
 <script>
 const $ = id => document.getElementById(id);
-const clock = d => d.toLocaleTimeString([], { hour: "numeric", minute: "2-digit" });
+const clock = d => d.toLocaleTimeString([], { hour: "numeric", minute: "2-digit", hour12: true });
+const at = t => clock(new Date(t * 1000));
+const hm = mins => mins < 60 ? `${mins}m` : `${Math.floor(mins / 60)}h ${String(mins % 60).padStart(2, "0")}m`;
+const cap = s => s.charAt(0).toUpperCase() + s.slice(1);
+const nightLabel = date => new Date(date + "T12:00:00").toLocaleDateString([], { weekday: "short", month: "short", day: "numeric" });
 const hhmmToDate = s => { const [h, m] = s.split(":").map(Number); const d = new Date(); d.setHours(h, m, 0, 0); return d; };
 const ago = s => s < 90 ? "just now" : s < 5400 ? `${Math.round(s / 60)} min ago` : s < 172800 ? `${Math.round(s / 3600)} h ago` : `${Math.round(s / 86400)} days ago`;
 
+let settingsProblem = null; // why wake.py can't use settings.json, until the next save
 function updateSummary() {
-  if (!$("enabled").checked) { $("summary").textContent = "Alarm is off."; return; }
-  const end = hhmmToDate($("alarm").value || "06:30");
-  const win = Number($("window").value);
-  const start = new Date(end - win * 60000);
-  $("summary").textContent = win ? `Wakes you between ${clock(start)} and ${clock(end)}.` : `Wakes you at ${clock(end)}.`;
+  if (!$("enabled").checked) {
+    $("summary").textContent = settingsProblem
+      ? `Alarm is off because ${settingsProblem} in settings.json. Pick a time and save to fix it.`
+      : "Alarm is off.";
+    return;
+  }
+  if (!$("alarm").value) { $("summary").textContent = "Pick a wake-up time."; return; }
+  const end = hhmmToDate($("alarm").value);
+  const win = Number($("window").value), fade = Number($("fade").value);
+  const before = mins => clock(new Date(end - mins * 60000));
+  // as wake.py: light sleep is watched for only when the window is longer than the fade;
+  // otherwise the fade starts when the window opens
+  $("summary").textContent = win > fade
+    ? `Between ${before(win)} and ${clock(end)}, when you're in light sleep, the SNOOZ fades out over ${fade} min. The watch buzzes at ${clock(end)} if you're still asleep.`
+    : `The SNOOZ fades out from ${before(win ? win : fade)} to ${clock(end)}, then the watch buzzes at ${clock(end)}.`
+      + (win ? " To watch for light sleep, make the window longer than the fade." : "");
+}
+
+function selectValue(select, minutes) {
+  if (![...select.options].some(o => Number(o.value) === minutes)) select.add(new Option(`${minutes} min`, minutes));
+  select.value = String(minutes);
 }
 
 async function loadSettings() {
   const s = await (await fetch("/api/settings")).json();
   $("enabled").checked = s.enabled;
-  $("alarm").value = s.alarm_time;
-  const w = $("window");
-  if (![...w.options].some(o => Number(o.value) === s.window_minutes)) w.add(new Option(`${s.window_minutes} min`, s.window_minutes));
-  w.value = String(s.window_minutes);
+  $("alarm").value = s.alarm_time ?? "";
+  settingsProblem = s.problem;
+  selectValue($("window"), s.window_minutes);
+  selectValue($("fade"), s.fade_minutes);
   updateSummary();
 }
 
@@ -117,29 +188,37 @@ async function saveSettings() {
   try {
     const r = await fetch("/api/settings", {
       method: "POST", headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ enabled: $("enabled").checked, alarm_time: $("alarm").value, window_minutes: Number($("window").value) }),
+      body: JSON.stringify({
+        enabled: $("enabled").checked, alarm_time: $("alarm").value,
+        window_minutes: Number($("window").value), fade_minutes: Number($("fade").value),
+      }),
     });
     const s = await r.json();
     $("saved").textContent = r.ok ? `Saved at ${clock(new Date())}.` : `Not saved: ${s.error}`;
+    if (r.ok) { settingsProblem = null; updateSummary(); }
+    if (r.ok && $("night").value) showNight($("night").value); // the "would have" line follows the new settings
   } catch { $("saved").textContent = "Not saved: can't reach the Pi."; }
   $("save").disabled = false;
 }
 
-let nights = [];
+let nights = [], now = 0, current = null;
 async function loadNights() {
   const data = await (await fetch("/api/nights")).json();
   nights = data.nights;
-  if (!nights.length) { $("status").textContent = "No nights recorded yet."; return; }
+  now = data.now;
+  if (!nights.length) {
+    $("status").textContent = "No nights recorded yet.";
+    const date = lastNight();
+    if (diary.date !== date) fillDiary(date, (await (await fetch("/api/diary")).json()).entries[date]);
+    return;
+  }
   const latest = nights[0], since = data.now - latest.last_received;
   $("status").innerHTML = since < 300
     ? `<span class="live">● Recording now</span> (last data ${ago(since)})`
     : `<span class="stale">Not recording. Last data ${ago(since)}.</span>`;
   const keep = $("night").value;
   $("night").innerHTML = "";
-  for (const n of nights) {
-    const d = new Date(n.date + "T12:00:00");
-    $("night").add(new Option(d.toLocaleDateString([], { weekday: "short", month: "short", day: "numeric" }), n.date));
-  }
+  for (const n of nights) $("night").add(new Option(nightLabel(n.date), n.date));
   $("pickrow").hidden = false;
   const pick = nights.some(n => n.date === keep) ? keep : nights[0].date;
   $("night").value = pick;
@@ -148,35 +227,158 @@ async function loadNights() {
 
 async function showNight(date) {
   const n = nights.find(x => x.date === date);
-  const mins = Math.round((n.end - n.start) / 60);
-  $("sDur").textContent = `${Math.floor(mins / 60)}h ${String(mins % 60).padStart(2, "0")}m`;
+  if (!n) return;
+  const r = await fetch(`/api/night?date=${date}`);
+  if (!r.ok || $("night").value !== date) return; // the picker moved on while this loaded
+  const d = current = await r.json();
+  const a = d.analysis || {};
+  const asleep = a.onset != null;
+  $("sDur").textContent = hm(asleep ? a.asleep_minutes : Math.round((n.end - n.start) / 60));
+  $("sDurLabel").textContent = asleep ? "asleep" : "recorded";
   $("sHr").textContent = n.hr_avg ?? "–";
   $("sLow").textContent = n.hr_min ?? "–";
   $("detail").hidden = false;
-  drawChart((await (await fetch(`/api/night?date=${date}`)).json()).minutes);
+  drawChart(d);
+  $("story").textContent = story(d, n);
+  fillDiary(date, d.diary);
 }
 
-function drawChart(rows) {
+// wake.py's log for the night, reduced to the three moments the chart and story show
+function actualTimes(log) {
+  if (!log) return null;
+  const num = v => typeof v === "number" ? v : null;
+  const times = {
+    fade: num(log.fade_start),
+    buzz: num(log.buzz?.first_sent ?? log.buzz_first_sent),
+    awake: num(log.awake ?? log.buzz?.awake),
+    reason: log.reason,
+    smart: log.window_start < log.latest_start, // false when the window was no longer than the fade
+    fadeFailed: log.snooz?.ok === false, // ok is null while the fade is still running
+    notConnected: log.buzz?.stopped === "not connected",
+  };
+  return (times.fade ?? times.buzz ?? times.awake) != null ? times : null;
+}
+
+// the reasons wake.py writes to its log
+const FADE_REASONS = { light_sleep: "light sleep", fallback: "no light sleep seen", "fallback (no watch data)": "no watch data", no_data: "no watch data" };
+// "disabled" replaces the fade's reason when the alarm is switched off after its fade started
+const ENDINGS = { disabled: "then the alarm was switched off" };
+// a log with no fade, buzz or button press: what stopped the alarm first
+const NOT_RUN = {
+  disabled: "The alarm was switched off during the smart window, before any fade.",
+  rescheduled: "The alarm was moved during the smart window, so this one didn't fade or buzz.",
+  missed: "The Pi's clock jumped past the alarm, so it didn't fade or buzz.",
+};
+
+function actualLine(act) {
+  const why = act.reason === "fallback" && !act.smart ? "no smart window" : FADE_REASONS[act.reason];
+  const parts = [];
+  if (act.fade != null) parts.push(act.fadeFailed
+    ? `the SNOOZ fade at ${at(act.fade)}${why ? ` (${why})` : ""} failed`
+    : `the fade started at ${at(act.fade)}${why ? ` (${why})` : ""}`);
+  if (act.buzz != null) parts.push(`the watch buzzed at ${at(act.buzz)}`);
+  else if (act.notConnected) parts.push("the watch wasn't connected, so the Pi couldn't buzz it");
+  if (act.awake != null) parts.push(`you pressed the button at ${at(act.awake)}`);
+  if (ENDINGS[act.reason]) parts.push(ENDINGS[act.reason]);
+  return cap(parts.join("; ")) + ".";
+}
+
+function simulationLine(s, used, n, live) {
+  const win = s.window_start < s.latest_start; // a smart window: longer than the fade
+  let text;
+  if (s.reason === "light_sleep") text = `the fade would have started at ${at(s.fade_start)} (${s.trigger}) with the current settings.`;
+  else if (live && s.fade_start > now) text = win
+    ? `the fade would start between ${at(s.window_start)} and ${at(s.latest_start)}, at the first sign of light sleep, with the current settings.`
+    : `the fade would start at ${at(s.fade_start)} with the current settings.`;
+  else if (s.reason === "fallback") text = `the fade would have started at ${at(s.fade_start)} (${win ? "no light sleep seen by then" : "no smart window"}) with the current settings.`;
+  else text = `the recording ends at ${at(n.end)}, so the fade would have started at ${at(s.fade_start)} without watch data, with the current settings.`;
+  return used.enabled ? cap(text) : `If the alarm were on, ${text}`;
+}
+
+function story(d, n) {
+  const a = d.analysis || {}, parts = [];
+  if (a.onset != null) {
+    const light = a.light_minutes ? `${hm(a.light_minutes)} of it light sleep` : "no light sleep found";
+    parts.push(a.final_wake != null
+      ? `Asleep ${at(a.onset)} to ${at(a.final_wake)} (${hm(a.asleep_minutes)}), ${light}.`
+      : `Asleep from ${at(a.onset)} (${hm(a.asleep_minutes)} until the data ends), ${light}.`);
+  } else if (d.minutes.length) {
+    parts.push("No sleep onset found yet.");
+  }
+  const act = actualTimes(d.actual);
+  if (act) parts.push(actualLine(act));
+  else {
+    if (NOT_RUN[d.actual?.reason]) parts.push(NOT_RUN[d.actual.reason]);
+    if (d.simulation) parts.push(simulationLine(d.simulation, d.settings_used, n, now - n.last_received < 300));
+  }
+  return parts.join(" ");
+}
+
+function drawChart(night) {
+  const rows = night.minutes;
   const cv = $("chart"), dpr = window.devicePixelRatio || 1;
   const W = cv.clientWidth, H = cv.clientHeight;
   cv.width = W * dpr; cv.height = H * dpr;
   const g = cv.getContext("2d"); g.scale(dpr, dpr); g.clearRect(0, 0, W, H);
+  const act = actualTimes(night.actual);
+  $("legAct").hidden = !act;
   if (!rows.length) return;
   const css = getComputedStyle(document.documentElement);
   const col = n => css.getPropertyValue(n).trim();
-  const L = 34, R = 8, top = 6, movH = (H - 30) * 0.4, gap = 12, hrTop = top + movH + gap, hrH = H - 24 - hrTop;
+  const L = 34, R = 8;
   const t0 = rows[0].t, t1 = Math.max(rows[rows.length - 1].t, t0 + 60);
   const x = t => L + (t - t0) / (t1 - t0) * (W - L - R);
+  const xc = t => Math.max(L, Math.min(W, x(t)));
   const barW = Math.max(1, (W - L - R) / ((t1 - t0) / 60) - 0.5);
+  const a = night.analysis || {}, s = night.simulation;
+
+  // event lines, labelled in a strip above the movement area that is as tall as the labels need
+  const events = [];
+  const addEvent = (t, color, dashed, label) => {
+    if (t != null && t >= t0 && t <= t1 + 60) events.push({ t, px: Math.round(x(t)) + 0.5, color, dashed, label });
+  };
+  addEvent(a.onset, col("--text"), true, "asleep");
+  if (a.onset != null) addEvent(a.final_wake, col("--text"), true, "awake"); // awake all along isn't a wake-up
+  if (s) addEvent(s.fade_start, col("--accent"), false, "fade");
+  if (act) {
+    addEvent(act.fade, col("--act"), false, act.fadeFailed ? "fade failed" : "faded");
+    addEvent(act.buzz, col("--act"), false, "buzz");
+    addEvent(act.awake, col("--act"), false, "button");
+  }
+  g.font = "11px system-ui";
+  const labels = placeLabels(g, events, W);
+  const strip = 12 * labels.reduce((n, l) => Math.max(n, l.row + 1), 0);
+  const top = 6 + strip, movH = (H - 30 - strip) * 0.4, gap = 12, hrTop = top + movH + gap, hrH = H - 24 - hrTop;
+
+  // light sleep and awake stretches, behind the movement bars
+  const shade = (spans, color, alpha) => {
+    g.globalAlpha = alpha; g.fillStyle = color;
+    for (const [from, to] of spans || []) if (to > t0 && from <= t1) g.fillRect(xc(from), top, xc(to) - xc(from), movH);
+    g.globalAlpha = 1;
+  };
+  shade(a.light_spans, col("--accent"), 0.22);
+  shade(a.awake_spans, col("--dim"), 0.25);
 
   // movement bars, scaled to the 98th percentile so one big toss doesn't flatten the rest
-  const movs = rows.map(r => r.mov).sort((a, b) => a - b);
+  const movs = rows.map(r => r.mov).filter(v => v != null).sort((p, q) => p - q);
   const movMax = movs[Math.floor(movs.length * 0.98)] || movs[movs.length - 1] || 1;
   g.fillStyle = col("--mov");
   for (const r of rows) {
+    if (r.mov == null) continue;
     const h = Math.min(1, r.mov / movMax) * movH;
     g.fillRect(x(r.t), top + movH - h, barW, h);
   }
+
+  // the fade band along the top of the movement area, then the event lines
+  if (s && s.fade_end > t0 && s.fade_start <= t1 + 60) {
+    g.fillStyle = col("--accent");
+    g.fillRect(xc(s.fade_start), top, Math.max(2, xc(s.fade_end) - xc(s.fade_start)), 4);
+  }
+  for (const e of events) {
+    g.strokeStyle = e.color; g.lineWidth = e.dashed ? 1 : 1.5; g.setLineDash(e.dashed ? [4, 3] : []);
+    g.beginPath(); g.moveTo(e.px, top); g.lineTo(e.px, hrTop + hrH); g.stroke();
+  }
+  g.setLineDash([]);
 
   // heart rate line
   const hrs = rows.filter(r => r.hr != null).map(r => r.hr);
@@ -211,12 +413,118 @@ function drawChart(rows) {
     const h = d.getHours();
     g.fillText(`${h % 12 || 12}${h < 12 ? "a" : "p"}`, x(d / 1000), H - 6);
   }
+
+  g.textAlign = "left";
+  for (const l of labels) { g.fillStyle = l.color; g.fillText(l.label, l.left, 12 * l.row + 12); }
 }
 
-$("enabled").onchange = $("alarm").oninput = $("window").onchange = updateSummary;
+// Labels for lines a few pixels apart in the same colour are merged ("buzz + button"). Each label
+// takes the first free spot: centred on its line in rows 0-2, then beside it. One with no room is left out.
+function placeLabels(g, events, W) {
+  const groups = [];
+  for (const e of [...events].sort((p, q) => p.px - q.px)) {
+    const last = groups[groups.length - 1];
+    if (last && last.color === e.color && e.px - last.px < 6) last.label += ` + ${e.label}`;
+    else groups.push({ px: e.px, color: e.color, label: e.label });
+  }
+  const taken = [[], [], []], placed = [];
+  for (const l of groups) {
+    const w = g.measureText(l.label).width;
+    const spots = [l.px - w / 2, l.px + 3, l.px - w - 3].map(left => Math.max(0, Math.min(W - w, left)));
+    const fit = spots.flatMap(left => [0, 1, 2].map(row => ({ left, row })))
+      .find(({ left, row }) => taken[row].every(([a, b]) => left > b + 3 || left + w < a - 3));
+    if (!fit) continue;
+    taken[fit.row].push([fit.left, fit.left + w]);
+    placed.push({ ...l, ...fit });
+  }
+  return placed;
+}
+
+// ---------- diary ----------
+
+const diary = { date: null, dirty: false, melatonin: null, sober: null, rating: null };
+const drafts = {}; // unsaved edits per night, so moving the night picker doesn't throw them away
+
+function lastNight() {
+  const d = new Date(Date.now() - 12 * 3600000); // before noon, last night is yesterday's evening
+  return `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, "0")}-${String(d.getDate()).padStart(2, "0")}`;
+}
+
+const diaryValues = () => ({ melatonin: diary.melatonin, sober: diary.sober, rating: diary.rating, notes: $("notes").value });
+
+function fillDiary(date, entry) {
+  if (date === diary.date && diary.dirty) return; // the minute refresh must not wipe what's being typed
+  if (diary.dirty) drafts[diary.date] = diaryValues();
+  const draft = drafts[date];
+  delete drafts[date];
+  const shown = draft || entry;
+  Object.assign(diary, { date, dirty: !!draft, melatonin: shown?.melatonin ?? null, sober: shown?.sober ?? null, rating: shown?.rating ?? null });
+  $("notes").value = shown?.notes ?? "";
+  $("dNight").textContent = `Night of ${nightLabel(date)}`;
+  $("dSaved").textContent = draft ? "Not saved yet." : entry?.updated ? `Saved at ${at(entry.updated)}.` : "";
+  $("dSave").disabled = false;
+  renderDiary();
+}
+
+// clears the unsaved mark (or the draft, if the picker moved on) only if nothing was edited while saving
+function markSaved(date, sent) {
+  const same = values => JSON.stringify(values) === JSON.stringify(sent);
+  if (diary.date === date) { if (same(diaryValues())) diary.dirty = false; }
+  else if (drafts[date] && same(drafts[date])) delete drafts[date];
+}
+
+function renderDiary() {
+  for (const seg of document.querySelectorAll(".seg")) {
+    for (const b of seg.children) {
+      const on = String(diary[seg.dataset.key]) === b.dataset.v;
+      b.classList.toggle("on", on); b.setAttribute("aria-pressed", on);
+    }
+  }
+  for (const b of $("rating").children) {
+    const on = Number(b.textContent) === diary.rating;
+    b.classList.toggle("on", on); b.setAttribute("aria-pressed", on);
+  }
+}
+
+async function saveDiary() {
+  const date = diary.date, sent = diaryValues();
+  let message;
+  $("dSave").disabled = true;
+  try {
+    const r = await fetch("/api/diary", {
+      method: "POST", headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ date, ...sent }),
+    });
+    const s = await r.json();
+    if (r.ok) markSaved(date, sent);
+    message = r.ok ? `Saved at ${clock(new Date())}.` : `Not saved: ${s.error}`;
+  } catch { message = "Not saved: can't reach the Pi."; }
+  if (diary.date === date) $("dSaved").textContent = message;
+  $("dSave").disabled = false;
+}
+
+for (let i = 1; i <= 10; i++) {
+  const b = document.createElement("button");
+  b.type = "button"; b.textContent = i;
+  b.onclick = () => { diary.rating = diary.rating === i ? null : i; diary.dirty = true; renderDiary(); };
+  $("rating").append(b);
+}
+for (const seg of document.querySelectorAll(".seg")) {
+  seg.onclick = e => {
+    const b = e.target.closest("button");
+    if (!b) return;
+    const v = b.dataset.v === "true", key = seg.dataset.key;
+    diary[key] = diary[key] === v ? null : v; // tapping the chosen answer again clears it
+    diary.dirty = true; renderDiary();
+  };
+}
+$("notes").oninput = () => { diary.dirty = true; };
+$("dSave").onclick = saveDiary;
+
+$("enabled").onchange = $("alarm").oninput = $("window").onchange = $("fade").onchange = updateSummary;
 $("save").onclick = saveSettings;
 $("night").onchange = e => showNight(e.target.value);
-window.addEventListener("resize", () => $("night").value && showNight($("night").value));
+window.addEventListener("resize", () => current && drawChart(current));
 loadSettings();
 loadNights();
 setInterval(loadNights, 60000);

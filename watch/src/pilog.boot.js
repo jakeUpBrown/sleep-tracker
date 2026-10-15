@@ -23,9 +23,10 @@
   var n=0,ms=0,mx=0,sx=0,sy=0,sz=0,hs=0,hn=0,hc=0;
   Bangle.on("accel",function(a){n++;ms+=a.diff;if(a.diff>mx)mx=a.diff;sx+=a.x;sy+=a.y;sz+=a.z;});
   Bangle.setHRMPower(1,"pilog");
-  Bangle.on("HRM",function(h){if(h.confidence>hc)hc=h.confidence;if(h.bpm>0){hs+=h.bpm;hn++;}});
+  // hr and hr_conf describe the same reading: the most confident one in the row
+  Bangle.on("HRM",function(h){if(h.bpm>0&&h.confidence>=hc){hc=h.confidence;hs=h.bpm;hn=1;}});
   var f=S.open("pilog.csv","a");
-  // Every 10 s: unix time, accel samples, movement sum, movement max, mean x/y/z, mean bpm, best HR confidence, battery %
+  // Every 10 s: unix time, accel samples, movement sum, movement max, mean x/y/z, bpm and confidence of the most confident HR reading, battery %
   setInterval(function(){
     var l=[Math.round(Date.now()/1000),n,ms.toFixed(3),mx.toFixed(3),
       n?(sx/n).toFixed(2):"",n?(sy/n).toFixed(2):"",n?(sz/n).toFixed(2):"",

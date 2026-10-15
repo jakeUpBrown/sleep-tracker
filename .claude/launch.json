@@ -1,0 +1,11 @@
+{
+  "version": "0.0.1",
+  "configurations": [
+    {
+      "name": "sleepweb",
+      "runtimeExecutable": "py",
+      "runtimeArgs": ["-3", "-u", "web/sleepweb.py", "--port", "8000"],
+      "port": 8000
+    }
+  ]
+}
