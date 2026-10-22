@@ -6,6 +6,7 @@ Read README.md first: it describes every component and the install/update flow, 
 - Raspberry Pi 3B+ (Raspberry Pi OS, Python 3.13), Bangle.js 2 watch, SNOOZ white noise machine. DS3231 clock and an addressable LED strip are on order.
 - Working: SNOOZ control (`snooz/`), watch app + Pi logger (`watch/`), phone web app with diary (`web/`), sleep analysis (`analysis/`), smart alarm service (`wake/`). The movement thresholds (`active_floor`, `active_ratio`) were set from the first real night, 2026-10-14; the others still have no real nights behind them.
 - Not built yet: `sunrise.py` (LED light ramp). When it arrives it joins the fade in `wake.py`.
+- Enclosure (`enclosure/sconce.scad`, October 2026): a wall sconce to the left of the headboard holding the Pi, a Perma-Proto HAT and the 1 m strip (5 rows of 12) behind a diffuser and a louver that aims the light at the owner's pillow and away from the partner's. Designed, not printed yet. The SNOOZ stays across the room.
 - Alarm semantics (owner's choice, October 2026): `alarm_time` is the time to be awake by. From `alarm_time - window_minutes` the SNOOZ fade starts at the first light-sleep sign, otherwise at `alarm_time - fade_minutes` (a window no longer than the fade means no watching: the fade starts when the window opens); the fade ends by `alarm_time`; the watch buzzes at `alarm_time` as the last resort, with the watch's own built-in alarm as a backup. The SNOOZ fade is the wake stimulus, not the buzz.
 
 ## Conventions
