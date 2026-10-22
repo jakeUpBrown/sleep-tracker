@@ -6,6 +6,8 @@ A small wall light that holds the whole Pi side of the project: the Pi 3B+, a Pe
 
 `sconce.scad` is a parametric OpenSCAD model. Open it in [OpenSCAD](https://openscad.org), open the Customizer (Window > Customizer), set the values, pick a `part`, render (F6) and export the STL. With the defaults it comes out 228 × 115 × 77 mm (wide × tall × deep). That fits a 250 × 210 mm bed (MK3/MK4/Core One) but not a Prusa Mini.
 
+`DESIGN-NOTES.md` explains why the design is the way it is, what was assumed and what is still open.
+
 ## How it works
 
 From the wall outward:
