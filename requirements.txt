@@ -1,4 +1,5 @@
-# Python packages for the Bluetooth scripts (SNOOZ control and watch logger).
+# Python packages for the Pi's device scripts (SNOOZ control, watch logger, LED strip).
 # install.sh puts these in ~/snooz-env. The web app needs none of them.
 pysnooz==0.10.0  # snooz/*.py rely on this version's API
 bleak
+adafruit-circuitpython-neopixel-spi  # sunrise.py, SPI LED strip

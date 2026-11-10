@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Smart alarm: fade the SNOOZ out at the first sign of light sleep, then buzz the watch.
+"""Smart alarm: fade the SNOOZ out at the first sign of light sleep, then buzz the watch; a sunrise light.
 
 Usage:
   python -u wake.py                   run the alarm (the sleepwake service does this)
@@ -7,7 +7,7 @@ Usage:
   python wake.py --simulate DATE      what it would have done on the night of DATE (YYYY-MM-DD)
   python wake.py --test-buzz          ask the watch logger to buzz the watch once
   python wake.py --test-fade SECONDS  fade the SNOOZ out now, over SECONDS
-  python wake.py --dry-run            run the alarm with the SNOOZ and watch replaced by printed messages
+  python wake.py --dry-run            run the alarm with the SNOOZ, watch and light replaced by printed messages
 
 alarm_time in ~/sleeptracker/settings.json is the time to be awake by. From window_minutes before it,
 tonight's watch CSV goes through the same Detector as the web app's chart, and the first arousal starts
@@ -17,11 +17,16 @@ alarm, and a failed one is tried again while there is time. At the alarm, watch_
 (through watch-cmd.json) to buzz the watch until its button is pressed, for up to 10 minutes. Each night
 is logged to ~/sleeptracker/data/wake-DATE.json.
 
+Alongside, and never holding up the fade or the buzz, sunrise/sunrise.py brightens the LED strip over the
+30 minutes before the alarm and holds it at full for an hour after, unless it is turned off in the web app
+(light-cmd.json), the alarm or the light is switched off, or the alarm moves.
+
 Settings are re-read whenever settings.json changes. Before an alarm's window opens a change just replans it;
 inside it only what has not happened yet moves (a started fade runs on; "off" then "on" before the buzz resumes).
 """
 import argparse
 import json
+import math
 import os
 import subprocess
 import sys
@@ -29,19 +34,21 @@ import tempfile
 import threading
 import time
 import traceback
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from datetime import datetime, time as dtime, timedelta
 from pathlib import Path
 from typing import NamedTuple
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 from analysis.sleep_analysis import (  # noqa: E402
-    Detector, Row, alarm_unix_for_night, clean_settings, parse_csv_line, read_rows, simulate_wake, wake_window,
+    Detector, Row, alarm_unix_for_night, clean_settings, parse_csv_line, read_rows, simulate_wake, sunrise_times,
+    wake_window,
 )
 
 REPO = Path(__file__).resolve().parents[1]
 BASE = Path.home() / "sleeptracker"
 SNOOZ_SCRIPT = REPO / "snooz" / "snooz_ctl.py"
+SUNRISE_SCRIPT = REPO / "sunrise" / "sunrise.py"
 
 POLL_SECONDS = 10                 # the service loop runs tick() this often
 MIN_FADE_SECONDS = 30             # shortest fade, e.g. when the alarm is already due
@@ -52,8 +59,16 @@ BUZZ_GIVE_UP_SECONDS = 600        # stop asking this long after the alarm (the w
 AWAKE_SLACK_SECONDS = 60          # a button press this soon before the alarm still counts as awake
 STATUS_MAX_AGE_SECONDS = 60       # an older watch-status.json means the logger is gone
 FADE_TIMEOUT_SLACK_SECONDS = 120  # on top of the fade itself: finding and connecting to the SNOOZ
-OUTPUT_LINES = 5                  # lines of snooz_ctl.py output kept in the wake log
+OUTPUT_LINES = 5                  # lines of snooz_ctl.py / sunrise.py output kept in the wake log
 TEST_BUZZ_WAIT_SECONDS = 20       # --test-buzz waits this long for the logger to take the command
+LIGHT_ATTEMPTS = 3                # sunrise.py exits that count as failures before the light is given up
+LIGHT_CMD_MAX_AGE_SECONDS = 120   # an older light-cmd.json is ignored (and deleted)
+LIGHT_STOP_WAIT_SECONDS = 5       # after SIGTERM, before killing sunrise.py
+LIGHT_OFF_TIMEOUT_SECONDS = 15    # for `sunrise.py off` after a stop
+FINAL_LIGHT_STOPS = ("web", "failed")  # the light stays off for the rest of that alarm
+LIGHT_STOP_WORDS = {"timeout": "its hour at full brightness is over", "web": "turned off in the web app",
+                    "disabled": "the alarm was switched off", "setting": "the sunrise light was switched off",
+                    "rescheduled": "the alarm moved", "failed": "sunrise.py kept failing"}
 
 IDLE, WINDOW, FADING, BUZZING, DONE = "idle", "window", "fading", "buzzing", "done"
 CANCELLED = "cancelled"  # switched off in the window or fade: back on before the alarm is over resumes it
@@ -69,12 +84,13 @@ class Paths:
     status: Path
     cmd: Path
     logs: Path  # where wake-DATE.json goes: data, except for --dry-run
+    light_cmd: Path
 
     @classmethod
     def under(cls, base: Path, logs: Path | None = None) -> "Paths":
         data = base / "data"
         return cls(base, base / "settings.json", data, base / "watch-status.json", base / "watch-cmd.json",
-                   logs or data)
+                   logs or data, base / "light-cmd.json")
 
     def night_csv(self, date: str) -> Path:
         return self.data / f"watch-{date}.csv"
@@ -227,7 +243,17 @@ def fade_seconds(plan: Plan, now: int) -> int:
     return max(MIN_FADE_SECONDS, min(plan.fade_minutes * 60, plan.alarm_unix - now))
 
 
-def new_wake_log(plan: Plan, date: str, tuning: dict) -> dict:
+def new_light_log(alarm_unix: int, brightness: int | None) -> dict:
+    start, full, off = sunrise_times(alarm_unix)
+    return {"start": start, "full": full, "off_at": off, "brightness": brightness, "started": None, "finished": None,
+            "stopped": None, "ok": None, "returncode": None, "output": [], "attempts": 0}
+
+
+def light_is_on(light: dict) -> bool:
+    return bool(light.get("started")) and light.get("finished") is None
+
+
+def new_wake_log(plan: Plan, date: str, tuning: dict, brightness: int | None = None) -> dict:
     return {
         "date": date,
         **plan._asdict(),
@@ -238,6 +264,7 @@ def new_wake_log(plan: Plan, date: str, tuning: dict) -> dict:
         "trigger_t": None,
         "snooz": {"started": None, "finished": None, "ok": None, "returncode": None, "output": [], "attempts": 0},
         "buzz": {"first_sent": None, "resends": 0, "awake": None, "stopped": None, "watch_connected": None},
+        "light": new_light_log(plan.alarm_unix, brightness),
         "tuning": tuning,
         "finished": None,
     }
@@ -296,7 +323,7 @@ class WatchStatus(NamedTuple):
 
 
 def _unix_or_none(value) -> int | None:
-    if isinstance(value, bool) or not isinstance(value, (int, float)):
+    if isinstance(value, bool) or not isinstance(value, (int, float)) or not math.isfinite(value):
         return None
     return int(value)
 
@@ -408,6 +435,120 @@ class DryRunSnooz:
         return self._result
 
 
+# ---------- the sunrise light ----------
+
+class SunriseLight:
+    """Runs `sunrise.py run ...` as a long-running subprocess, one at a time, keeping its last output lines."""
+
+    def __init__(self, script: Path = SUNRISE_SCRIPT, python: str = sys.executable,
+                 stop_wait: float = LIGHT_STOP_WAIT_SECONDS) -> None:
+        self.command = [str(python), str(script)]
+        self.stop_wait = stop_wait
+        self._lock = threading.Lock()
+        self._proc: subprocess.Popen | None = None
+        self._reader: threading.Thread | None = None
+        self._result: dict | None = None
+
+    def start(self, start: int, full: int, off: int, brightness: int) -> bool:
+        """False if the light is already running or sunrise.py could not be started."""
+        args = ["run", "--start", str(int(start)), "--full", str(int(full)), "--off", str(int(off)),
+                "--brightness", str(int(brightness))]
+        with self._lock:
+            if self._result is not None and self._result["running"]:
+                return False
+            result = self._result = {"running": True, "returncode": None, "output": []}
+            try:
+                self._proc = subprocess.Popen(self.command + args, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+                                              text=True, encoding="utf-8", errors="replace",
+                                              env={**os.environ, "PYTHONUNBUFFERED": "1",
+                                                   "PYTHONIOENCODING": "utf-8"})
+            except OSError as e:
+                self._proc = None
+                result.update(running=False, output=[f"could not start sunrise.py: {e}"])
+                return False
+            self._reader = threading.Thread(target=self._read, args=(self._proc, result), daemon=True)
+            self._reader.start()
+        return True
+
+    def _read(self, proc: subprocess.Popen, result: dict) -> None:
+        try:
+            for line in proc.stdout:
+                if line.strip():
+                    with self._lock:
+                        result["output"] = (result["output"] + [line.rstrip()])[-OUTPUT_LINES:]
+        finally:  # running stays true until the last lines are in
+            proc.stdout.close()
+            returncode = proc.wait()
+            with self._lock:
+                result.update(running=False, returncode=returncode)
+
+    def stop(self, turn_off: bool = True) -> None:
+        """SIGTERM (sunrise.py turns the strip off), a kill if that is ignored, then `sunrise.py off` to be sure.
+
+        turn_off=False is for a restart with new arguments: SIGKILL, because SIGTERM would blank the strip,
+        while a killed sunrise.py leaves its last frame showing until the new one writes."""
+        with self._lock:
+            proc, reader = self._proc, self._reader
+        if proc is not None and proc.poll() is None:
+            if turn_off:
+                proc.terminate()
+                try:
+                    proc.wait(timeout=self.stop_wait)
+                except subprocess.TimeoutExpired:
+                    proc.kill()
+                    proc.wait(timeout=LIGHT_STOP_WAIT_SECONDS)
+            else:
+                proc.kill()
+                proc.wait(timeout=LIGHT_STOP_WAIT_SECONDS)
+        if reader is not None:
+            reader.join(timeout=2)
+        if turn_off:
+            self._turn_off()
+
+    def _turn_off(self) -> None:
+        try:
+            done = subprocess.run(self.command + ["off"], stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+                                  text=True, errors="replace", timeout=LIGHT_OFF_TIMEOUT_SECONDS)
+            lines = _last_lines(done.stdout) or [f"exit code {done.returncode}"]
+            problem = None if done.returncode == 0 else lines[-1]
+        except subprocess.TimeoutExpired:
+            problem = f"timed out after {LIGHT_OFF_TIMEOUT_SECONDS} s"
+        except OSError as e:
+            problem = str(e)
+        if problem and self._result is not None:
+            with self._lock:
+                self._result["output"] = (self._result["output"] + [f"sunrise.py off: {problem}"])[-OUTPUT_LINES:]
+
+    def result(self) -> dict | None:
+        """{"running", "returncode", "output"} of the latest run, or None before the first."""
+        with self._lock:
+            return None if self._result is None else {**self._result, "output": list(self._result["output"])}
+
+
+class DryRunLight:
+    def __init__(self, clock=time.time) -> None:
+        self.clock = clock
+        self._off: int | None = None
+        self._running = False
+
+    def start(self, start: int, full: int, off: int, brightness: int) -> bool:
+        _print(f"{stamp(self.clock())} [dry run] would run the sunrise light: from {clock12(start)}, "
+               f"full ({brightness}%) at {clock12(full)}, off at {clock12(off)}")
+        self._off, self._running = off, True
+        return True
+
+    def stop(self, turn_off: bool = True) -> None:
+        if self._running:
+            _print(f"{stamp(self.clock())} [dry run] would stop the sunrise light")
+        self._running = False
+
+    def result(self) -> dict | None:
+        if self._off is None:
+            return None
+        running = self._running and self.clock() < self._off
+        return {"running": running, "returncode": None if running else 0, "output": ["dry run"]}
+
+
 # ---------- the alarm ----------
 
 @dataclass
@@ -422,20 +563,25 @@ class Alarm:
     last_sent: int | None = None
     warned_disconnected: bool = False
     cancelled: tuple[str, str | None] | None = None  # (state, reason) when switched off, to resume them
+    light_failures: int = 0
+    superseded: bool = False  # finished because the alarm moved, so its sunrise light stops too
 
 
 class WakeController:
     """Runs one alarm at a time; tick() is called every POLL_SECONDS.
 
     snooz needs start(seconds) -> bool and result() -> dict | None (see SnoozFader);
-    watch needs send(cmd) and status() -> WatchStatus (see WatchCommander).
+    watch needs send(cmd) and status() -> WatchStatus (see WatchCommander);
+    light needs start(start, full, off, brightness) -> bool, stop(turn_off=True) and result() -> dict | None
+    (see SunriseLight). Without a light there is no sunrise track, so tests never drive the real strip.
     """
 
-    def __init__(self, paths: Paths, clock=time.time, snooz=None, watch=None, log=_print) -> None:
+    def __init__(self, paths: Paths, clock=time.time, snooz=None, watch=None, log=_print, light=None) -> None:
         self.paths = paths
         self.clock = clock
         self.snooz = snooz if snooz is not None else SnoozFader(clock=clock)
         self.watch = watch if watch is not None else WatchCommander(paths, clock)
+        self.light = light
         self.log = log
         self.settings = clean_settings({})
         self.alarm: Alarm | None = None
@@ -444,22 +590,31 @@ class WakeController:
         self._settings_key: tuple | None = ()  # matches no real key, so the first tick reads the file
         self._settings_error = False
         self._fade_owner: Alarm | None = None
+        # The light can outlive its alarm's DONE by up to 50 minutes, so it keeps its own reference
+        self._light_owner: Alarm | None = None
+        self._light_args: tuple[int, int, int, int] | None = None  # what sunrise.py runs with, while it runs
+        self._light_checked = False
+        self._light_error: str | None = None
 
     def tick(self) -> None:
         now = int(self.clock())
-        if self._reload_settings(now) and self.alarm is not None and self.alarm.state != DONE:
-            self._apply_settings(now)
-        self._collect_fade(now)
-        self._ensure_alarm(now)
-        for _ in range(6):  # a late start can pass through several states in one tick
-            alarm = self.alarm
-            if alarm is None or alarm.state == DONE:
-                break
-            state = alarm.state
-            self._step(now)
-            if self.alarm is alarm and alarm.state == state:
-                break
-        self._ensure_alarm(now)
+        try:
+            if self._reload_settings(now) and self.alarm is not None and self.alarm.state != DONE:
+                self._apply_settings(now)
+            self._collect_fade(now)
+            self._ensure_alarm(now)
+            for _ in range(6):  # a late start can pass through several states in one tick
+                alarm = self.alarm
+                if alarm is None or alarm.state == DONE:
+                    break
+                state = alarm.state
+                self._step(now)
+                if self.alarm is alarm and alarm.state == state:
+                    break
+            self._ensure_alarm(now)
+        finally:  # after the fade and buzz, so a slow stop of sunrise.py never delays them
+            if self.light is not None:
+                self._tick_light_safely(now)
 
     def _say(self, now: int, text: str) -> None:
         self.log(f"{stamp(now)} {text}")
@@ -518,6 +673,7 @@ class WakeController:
                 self._say(now, f"alarm moved: the watch buzzes at {clock12(plan.alarm_unix)}")
             else:
                 self._say(now, f"alarm moved to {day_and_time(plan.alarm_unix)}: no buzz this time")
+                alarm.superseded = True
                 self._finish(now)
 
     def _replan_window(self, alarm: Alarm, plan: Plan, tuning: dict, now: int) -> None:
@@ -582,12 +738,22 @@ class WakeController:
     def _new_alarm(self, plan: Plan, now: int) -> Alarm:
         date = night_date(plan.window_start)
         tuning = self.settings["tuning"]
-        alarm = Alarm(plan, date, tuning, new_wake_log(plan, date, tuning))
+        alarm = Alarm(plan, date, tuning, new_wake_log(plan, date, tuning, self.settings["sunrise_brightness"]))
         old = read_json(self.paths.wake_log(date))
-        if old and old.get("alarm_unix") == plan.alarm_unix and self._resume(alarm, old, now):
+        same = bool(old) and old.get("alarm_unix") == plan.alarm_unix
+        if same:
+            self._carry_light(alarm, old)
+        if same and self._resume(alarm, old, now):
             return alarm
         self._say(now, f"next alarm {day_and_time(plan.alarm_unix)}: {timeline_words(plan)}")
         return alarm
+
+    def _carry_light(self, alarm: Alarm, old: dict) -> None:
+        """Keep what the light did for this alarm (on, or turned off in the web app) across a restart or replan."""
+        light = old.get("light")
+        if isinstance(light, dict) and light.get("started"):
+            alarm.log["light"] = {**alarm.log["light"], **light}
+            alarm.logging = True
 
     def _resume(self, alarm: Alarm, old: dict, now: int) -> bool:
         """Carry on with an alarm whose fade or buzz started before wake.py restarted."""
@@ -776,6 +942,211 @@ class WakeController:
         self.last_done = alarm.plan.alarm_unix
         self.feed = None
 
+    # ----- the sunrise light: worked out afresh each tick from the clock, the settings and the alarm -----
+
+    def _tick_light_safely(self, now: int) -> None:
+        try:
+            self._tick_light(now)
+            self._light_error = None
+        except Exception as e:  # the light must never break the alarm
+            error = f"{type(e).__name__}: {e}"
+            if error != self._light_error:
+                self._say(now, f"sunrise light error (the alarm carries on): {error}")
+            self._light_error = error
+
+    def _tick_light(self, now: int) -> None:
+        if not self._light_checked:
+            self._light_checked = True
+            self._adopt_light(now)
+        self._collect_light(now)
+        target = self._light_target(now)
+        self._hand_over_light(target, now)
+        web_off = self._read_light_cmd(now)
+        if target is None:
+            return
+        light = target.log["light"]
+        on = self._light_on(target)
+        if web_off and on:
+            reason = "web"
+        elif light["stopped"] in FINAL_LIGHT_STOPS:
+            reason = light["stopped"]
+        else:
+            reason = self._light_off_reason()
+        if reason:
+            if on:
+                self._stop_light(target, now, reason)
+            return
+        args = (*sunrise_times(target.plan.alarm_unix), self.settings["sunrise_brightness"])
+        if args != self._light_args:
+            self._launch_light(target, args, now)
+
+    def _light_target(self, now: int) -> Alarm | None:
+        """The alarm whose light period [start, off) now is in: the current one, or the one whose
+        light is still holding after it reached DONE."""
+        for alarm in (self.alarm, self._light_owner):
+            if alarm is None or alarm.log.get("reason") == "missed":
+                continue
+            if alarm is not self.alarm and (alarm.state != DONE or alarm.superseded):
+                continue  # dropped for a replanned alarm
+            start, _, off = sunrise_times(alarm.plan.alarm_unix)
+            if start <= now < off:
+                return alarm
+        return None
+
+    def _light_on(self, alarm: Alarm) -> bool:
+        return (self._light_args is not None and alarm is self._light_owner) or light_is_on(alarm.log["light"])
+
+    def _light_off_reason(self) -> str | None:
+        if not self.settings["enabled"]:
+            return "disabled"
+        if not self.settings["sunrise_enabled"]:
+            return "setting"
+        return None
+
+    def _adopt_light(self, now: int) -> None:
+        """After a restart during the hour at full brightness, the alarm is DONE and the next one is
+        planned, so the light that was on is only in tonight's wake log. One switched off with the alarm
+        or the light's own switch is taken on too, so switching back on brings it back."""
+        if self._light_owner is not None:
+            return
+        log = read_json(self.paths.wake_log(night_date(now)))
+        light = log.get("light") if log else None
+        if not isinstance(light, dict) or not (light_is_on(light) or light.get("stopped") in ("disabled", "setting")):
+            return
+        if self.alarm is not None and self.alarm.plan.alarm_unix == log.get("alarm_unix"):
+            return  # _new_alarm carried it over
+        plan = Plan(*(log.get(key) for key in Plan._fields))
+        if not isinstance(plan.alarm_unix, int) or now >= sunrise_times(plan.alarm_unix)[2]:
+            return
+        date = night_date(plan.window_start)
+        fresh = new_wake_log(plan, date, {})
+        self._light_owner = Alarm(plan, date, log.get("tuning") or {},
+                                  {**fresh, **log, "light": {**fresh["light"], **light}}, state=DONE, logging=True)
+
+    def _hand_over_light(self, target: Alarm | None, now: int) -> None:
+        owner = self._light_owner
+        if owner is None or owner is target:
+            return
+        if target is not None and target.plan.alarm_unix == owner.plan.alarm_unix:
+            target.log["light"] = owner.log["light"]  # the same alarm, planned again: the light runs on
+            target.light_failures = owner.light_failures
+            target.logging = True
+            self._light_owner = target
+            self._write_light_log(target)
+            return
+        if self._light_on(owner):
+            if now >= owner.log["light"]["off_at"]:
+                reason = "timeout"
+            else:
+                reason = self._light_off_reason() or "rescheduled"
+            self._stop_light(owner, now, reason)
+        self._light_owner = None
+
+    def _read_light_cmd(self, now: int) -> bool:
+        """True for a fresh "off" from the web app's button. The file is deleted either way."""
+        path = self.paths.light_cmd
+        if not path.exists():
+            return False
+        data = read_json(path) or {}
+        try:
+            path.unlink(missing_ok=True)
+        except OSError as e:
+            self._say(now, f"could not delete light-cmd.json: {e}")
+        if data.get("cmd") != "off":
+            self._say(now, f"ignored light-cmd.json: {data or 'unreadable'}")
+            return False
+        sent = data.get("sent")
+        # NaN and Infinity are valid JSON to Python, and int() of them raises
+        fresh = (isinstance(sent, (int, float)) and not isinstance(sent, bool) and math.isfinite(sent)
+                 and abs(now - sent) <= LIGHT_CMD_MAX_AGE_SECONDS)
+        if not fresh:
+            when = clock12(sent) if isinstance(sent, (int, float)) and math.isfinite(sent) else repr(sent)
+            self._say(now, f"ignored a light-off command sent at {when}: not within "
+                           f"{LIGHT_CMD_MAX_AGE_SECONDS // 60} minutes of now")
+            return False
+        return True
+
+    def _launch_light(self, alarm: Alarm, args: tuple[int, int, int, int], now: int) -> None:
+        start, full, off, brightness = args
+        light = alarm.log["light"]
+        if self._light_args is not None:  # new brightness or times: sunrise.py is stateless, so this is seamless
+            self.light.stop(turn_off=False)
+            self._light_args = None
+            self._say(now, f"sunrise light: restarting it at {brightness}% brightness, off at {clock12(off)}")
+        elif light["ok"] is False and light["finished"] is None:
+            pass  # _light_failed said it is starting again
+        elif light_is_on(light):
+            self._say(now, f"sunrise light: turning it back on after a restart, off at {clock12(off)}")
+        else:
+            ramp = f"brightening until {clock12(full)}, " if now < full else ""
+            self._say(now, f"sunrise light on ({brightness}% at full): {ramp}off at {clock12(off)}")
+        if not light_is_on(light):
+            light.update(started=None, finished=None, stopped=None)
+        light.update(start=start, full=full, off_at=off, brightness=brightness, ok=None, returncode=None,
+                     attempts=light["attempts"] + 1)
+        alarm.logging = True  # the light can start before the window opens
+        self._light_owner = alarm
+        if not self.light.start(*args):
+            result = self.light.result() or {}
+            light["output"] = list(result.get("output") or ["could not start sunrise.py"])
+            self._light_failed(alarm, now)
+            return
+        self._light_args = args
+        if light["started"] is None:
+            light.update(started=now, output=[])
+        self._write_light_log(alarm)
+
+    def _collect_light(self, now: int) -> None:
+        owner = self._light_owner
+        if owner is None or self._light_args is None:
+            return
+        result = self.light.result()
+        if not result or result.get("running"):
+            return
+        off = self._light_args[2]
+        self._light_args = None
+        light = owner.log["light"]
+        light.update(returncode=result.get("returncode"), output=list(result.get("output") or []))
+        if result.get("returncode") == 0 and now >= off - POLL_SECONDS:  # sunrise.py exits by itself at off
+            light.update(finished=now, stopped="timeout", ok=True)
+            self._write_light_log(owner)
+            self._say(now, f"sunrise light off: {LIGHT_STOP_WORDS['timeout']}")
+            return
+        self._light_failed(owner, now)
+
+    def _light_failed(self, alarm: Alarm, now: int) -> None:
+        alarm.light_failures += 1
+        light = alarm.log["light"]
+        detail = light["output"][-1] if light["output"] else f"exit code {light['returncode']}"
+        if alarm.light_failures < LIGHT_ATTEMPTS and now < light["off_at"]:
+            light["ok"] = False
+            self._say(now, f"sunrise light failed: {detail}. Starting it again")
+        else:
+            light.update(finished=now, stopped="failed", ok=False)
+            self._say(now, f"sunrise light failed: {detail}. Giving up after {alarm.light_failures} tries")
+        self._write_light_log(alarm)
+
+    def _stop_light(self, alarm: Alarm, now: int, reason: str) -> None:
+        light = alarm.log["light"]
+        light.update(finished=now, stopped=reason, ok=True)
+        self._write_light_log(alarm)  # first, so a stop that fails can't lose the reason
+        self._say(now, f"sunrise light off: {LIGHT_STOP_WORDS[reason]}")
+        if self._light_args is not None and alarm is self._light_owner:
+            self.light.stop()
+            self._light_args = None
+            result = self.light.result() or {}
+            light.update(returncode=result.get("returncode"), output=list(result.get("output") or []))
+            self._write_light_log(alarm)
+
+    def _write_light_log(self, alarm: Alarm) -> None:
+        """_write_log, except that an alarm that has been replaced never overwrites its replacement's log
+        (the same night's file once the alarm moves); the old light's stop is then only in the service log."""
+        if alarm is not self.alarm:
+            on_disk = read_json(self.paths.wake_log(alarm.date))
+            if on_disk and on_disk.get("alarm_unix") != alarm.plan.alarm_unix:
+                return
+        self._write_log(alarm)
+
     def _write_log(self, alarm: Alarm) -> None:
         if not alarm.logging:
             return
@@ -787,6 +1158,19 @@ class WakeController:
 
 # ---------- command line ----------
 
+def light_status(paths: Paths, now: float) -> str | None:
+    """A line about this morning's sunrise light while it is (or would still be) on, else None."""
+    log = read_json(paths.wake_log(night_date(now))) or {}
+    light = log.get("light") if isinstance(log.get("light"), dict) else {}
+    off, finished = _unix_or_none(light.get("off_at")), _unix_or_none(light.get("finished"))
+    if off is None or now >= off or not light.get("started"):
+        return None
+    if light_is_on(light):
+        return f"Sunrise light: on now, until {clock12(off)}"
+    words = LIGHT_STOP_WORDS.get(light.get("stopped"), str(light.get("stopped")))
+    return f"Sunrise light: off since {clock12(finished)} ({words})" if finished else None
+
+
 def show_status(paths: Paths) -> int:
     now = time.time()
     settings = load_settings(paths)
@@ -797,19 +1181,30 @@ def show_status(paths: Paths) -> int:
     else:
         print(f"Next alarm: {day_and_time(plan.alarm_unix)} (the time to be awake by)")
         fade = (plan.alarm_unix - plan.latest_start) // 60  # window_minutes when that is the shorter
+        steps = []
         if smart_window(plan):
-            print(f"  {clock12(plan.window_start):>8}  starts watching the watch data for light sleep")
-            print(f"  {clock12(plan.latest_start):>8}  starts the {fade}-minute SNOOZ fade if it saw none by then")
+            steps.append((plan.window_start, "starts watching the watch data for light sleep"))
+            steps.append((plan.latest_start, f"starts the {fade}-minute SNOOZ fade if it saw none by then"))
         else:
             why = "the window is no longer than the fade" if plan.window_minutes else "window 0"
-            print(f"  {clock12(plan.latest_start):>8}  starts the {fade}-minute SNOOZ fade "
-                  f"(no smart window: {why})")
-        print(f"  {clock12(plan.alarm_unix):>8}  the SNOOZ is quiet and the watch buzzes until you press its "
-              f"button, for up to {BUZZ_GIVE_UP_SECONDS // 60} minutes")
+            steps.append((plan.latest_start, f"starts the {fade}-minute SNOOZ fade (no smart window: {why})"))
+        steps.append((plan.alarm_unix, f"the SNOOZ is quiet and the watch buzzes until you press its button, "
+                                       f"for up to {BUZZ_GIVE_UP_SECONDS // 60} minutes"))
+        if settings["sunrise_enabled"]:
+            start, full, off = sunrise_times(plan.alarm_unix)
+            brightness = settings["sunrise_brightness"]
+            level = f" ({brightness}% brightness)" if brightness < 100 else ""
+            steps.append((start, f"the sunrise light starts, full by {clock12(full)}{level}, off at {clock12(off)}"))
+        for unix, text in sorted(steps, key=lambda step: step[0]):
+            print(f"  {clock12(unix):>8}  {text}")
+        if not settings["sunrise_enabled"]:
+            print("Sunrise light: switched off in the web app")
         log = read_json(paths.wake_log(night_date(plan.window_start)))
         if log and log.get("alarm_unix") == plan.alarm_unix and log.get("fade_start"):
             why = str(log.get("reason")).replace("_", " ") + (f": {log['trigger']}" if log.get("trigger") else "")
             print(f"Under way: the fade started at {clock12(log['fade_start'])} ({why})")
+    if (line := light_status(paths, now)) is not None:
+        print(line)
     status = read_watch_status(paths.status, now)
     if status.connected:
         last = f", last data {clock12(status.last_row)}" if status.last_row else ""
@@ -886,10 +1281,12 @@ def run_test_fade(seconds: int) -> int:
 def run_service(paths: Paths, dry_run: bool) -> int:
     if dry_run:
         paths = Paths.under(paths.base, Path(tempfile.gettempdir()) / "sleepwake-dry-run")
-        controller = WakeController(paths, snooz=DryRunSnooz(), watch=DryRunWatch(paths))
-        _print(f"Dry run: the SNOOZ and watch are replaced by printed messages; wake logs go to {paths.logs}")
+        paths = replace(paths, light_cmd=paths.logs / "light-cmd.json")  # leaves the service's command alone
+        controller = WakeController(paths, snooz=DryRunSnooz(), watch=DryRunWatch(paths), light=DryRunLight())
+        _print(f"Dry run: the SNOOZ, watch and sunrise light are replaced by printed messages; "
+               f"wake logs go to {paths.logs}")
     else:
-        controller = WakeController(paths)
+        controller = WakeController(paths, light=SunriseLight())
     _print(f"{stamp(time.time())} wake.py started, reading {paths.settings}")
     last_error = None
     try:

@@ -11,7 +11,9 @@ It reconnects on its own if the watch drops off, and sets the watch's clock each
 
 It also passes commands from wake.py to the watch: ~/sleeptracker/watch-cmd.json is
 sent on and deleted, and ~/sleeptracker/watch-status.json says whether the watch is
-connected, when data last arrived and when the alarm screen's button was pressed.
+connected, when data last arrived, when the alarm screen's button was pressed, and from the
+watch's PB lines its battery level, whether the charger is live, whether it is recording and
+whether it was stopped by hand (charge.py powers the dock for those last two).
 """
 import asyncio
 import json
@@ -99,8 +101,11 @@ def command_js(cmd: str) -> str | None:
     return WATCH_JS.get(cmd)
 
 
-def write_status(path: Path, connected: bool, last_row: int | None, awake: int | None) -> None:
-    status = {"connected": connected, "last_row": last_row, "awake": awake, "updated": int(time.time())}
+def write_status(path: Path, connected: bool, last_row: int | None, awake: int | None,
+                 battery: int | None = None, charging: bool | None = None,
+                 recording: bool | None = None, hold: bool | None = None) -> None:
+    status = {"connected": connected, "last_row": last_row, "awake": awake, "battery": battery,
+              "charging": charging, "recording": recording, "hold": hold, "updated": int(time.time())}
     tmp = path.with_name(path.name + ".tmp")
     tmp.write_text(json.dumps(status))
     os.replace(tmp, path)  # readers never see a half-written file
@@ -114,15 +119,25 @@ class Recorder:
         self.connected = False
         self.last_row_unix = None  # Pi time of the last saved row
         self.awake = None  # watch time the alarm screen's button was pressed
+        self.battery = None    # from the watch's PB lines and data rows
+        self.charging = None   # from the PB lines: is the charger live
+        self.recording = None  # from the PB lines (a data row means yes)
+        self.hold = None       # from the PB lines: stopped by hand
 
     def save_status(self) -> None:
-        write_status(self.status_path, self.connected, self.last_row_unix, self.awake)
+        write_status(self.status_path, self.connected, self.last_row_unix, self.awake,
+                     self.battery, self.charging, self.recording, self.hold)
 
     def set_connected(self, connected: bool) -> None:
         self.connected = connected
+        # What the watch said last time is not current now: charge.py must wait for a fresh line
+        self.battery = self.charging = self.recording = self.hold = None
         self.save_status()
 
     def handle_line(self, line: str) -> None:
+        if line.startswith("PB,"):
+            self.mark_battery(line)
+            return
         if not line.startswith("PL,"):
             return  # watch console chatter, ignore
         values = line[3:].split(",")
@@ -143,11 +158,27 @@ class Recorder:
         self.rows += 1
         self.last_row = time.monotonic()
         self.last_row_unix = pi_unix
+        try:
+            self.battery = int(values[-1])
+        except ValueError:
+            pass
+        self.recording = True
         self.save_status()
         if self.rows % 6 == 1:  # print about once a minute
             row = dict(zip(WATCH_FIELDS, values))
             print(f"{stamp()} saved {self.rows} rows to {path.name}: movement {row['mov_sum']}, "
                   f"heart rate {row['hr'] or '-'} (confidence {row['hr_conf']}), battery {row['battery']}%")
+
+    def mark_battery(self, line: str) -> None:
+        # PB,<battery %>,<flags>: flags bit 0 charger live, bit 1 recording, bit 2 stopped by hand
+        try:
+            battery, flags = line[3:].split(",")
+            self.battery, flags = int(battery), int(flags)
+        except ValueError:
+            print(f"{stamp()} skipped a garbled line: {line!r}")
+            return
+        self.charging, self.recording, self.hold = bool(flags & 1), bool(flags & 2), bool(flags & 4)
+        self.save_status()
 
     def mark_awake(self, values: list[str]) -> None:
         try:

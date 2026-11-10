@@ -1,22 +1,51 @@
 // Pi Sleep Log: background logger. Runs under every app (clock included) while switched on.
 (function(){
-  var S=require("Storage");
-  function isOn(){return !!(S.readJSON("pilog.json",1)||{}).on;}
-  // Off the charger starts recording, back on the charger stops it.
+  var S=require("Storage"),chg,arm,k=0,t0=0,j;
+  function st(){return S.readJSON("pilog.json",1)||{};}
+  // Battery and state for the Pi's charge control: the advert for its scan (kept up while connected, so a
+  // phone or the IDE doesn't hide it), the PB line for the logger. Flags: 1 charger live, 2 recording, 4 hand stop.
+  function bat(){
+    var b=E.getBattery(),o=st(),c=(Bangle.isCharging()?1:0)|(o.on?2:0)|(o.hold?4:0);
+    try{NRF.setAdvertising({0x180F:[b]},{manufacturer:0x0590,manufacturerData:[c],whenConnected:true});}catch(e){}
+    if(NRF.getSecurityStatus().connected)Bluetooth.println("PB,"+b+","+c);
+  }
+  bat();setInterval(bat,60000);
+  // Back on the charger stops recording. Off the charger only arms it: recording starts once the watch
+  // has moved (3 jolts within 5 s), because the Pi cutting the dock's power looks just like being taken off.
+  // A hand stop sets hold, so it stays stopped until the watch has been back on the charger.
+  function disarm(){if(arm)Bangle.removeListener("accel",arm);arm=undefined;}
+  function armIt(){
+    if(arm)return;
+    k=0;
+    arm=function(a){
+      if(a.diff<=0.15)return;
+      var t=Date.now();
+      if(t-t0>5000){t0=t;k=0;}
+      if(++k<3)return;
+      disarm();
+      S.writeJSON("pilog.json",{on:true});
+      S.open("pilog.csv","a").write("# start "+Math.round(Date.now()/1000)+" t,samples,mov_sum,mov_max,ax,ay,az,hr,hr_conf,battery\n");
+      load(); // reload so the logger starts
+    };
+    Bangle.on("accel",arm);
+  }
   // Wait 3 s and re-check so a wobbly charger contact doesn't flip it back and forth.
-  var chg;
   Bangle.on("charging",function(){
     if(chg)clearTimeout(chg);
     chg=setTimeout(function(){
       chg=undefined;
-      var o=!Bangle.isCharging();
-      if(o==isOn())return;
-      S.writeJSON("pilog.json",{on:o});
-      if(o)S.open("pilog.csv","a").write("# start "+Math.round(Date.now()/1000)+" t,samples,mov_sum,mov_max,ax,ay,az,hr,hr_conf,battery\n");
-      load(); // reload so the logger starts or stops
+      j=st();
+      if(Bangle.isCharging()){
+        disarm();
+        if(j.on||j.hold)S.writeJSON("pilog.json",{on:false});
+        if(j.on)load(); // reload so the logger stops
+      }else if(!j.on&&!j.hold)armIt();
     },3000);
   });
-  if(!isOn()) return;
+  j=st();
+  if(Bangle.isCharging()&&j.hold)S.writeJSON("pilog.json",{on:false});
+  else if(!j.on&&!j.hold&&!Bangle.isCharging())armIt();
+  if(!j.on) return;
   global.PILOG=1;
   // Keep the accelerometer at a steady 12.5 Hz so movement numbers are comparable all night.
   // powerSave:false stops the watch dropping to 800 ms polls, but doesn't undo a drop that already

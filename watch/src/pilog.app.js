@@ -14,7 +14,7 @@ function draw(){
 Bangle.setUI({mode:"custom",
   touch:function(){
     var o=!isOn();
-    S.writeJSON("pilog.json",{on:o});
+    S.writeJSON("pilog.json",o?{on:true}:{on:false,hold:true});
     if(o)S.open("pilog.csv","a").write("# start "+Math.round(Date.now()/1000)+" t,samples,mov_sum,mov_max,ax,ay,az,hr,hr_conf,battery\n");
     load("pilog.app.js"); // reload so the background logger starts or stops
   },

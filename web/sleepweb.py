@@ -6,7 +6,10 @@ Usage:
   python3 sleepweb.py --port 8080  serve on another port
 
 Open http://<pi-address>:8000 on your phone and add it to the home screen.
-Settings are saved to ~/sleeptracker/settings.json, which wake.py reads.
+Settings are saved to ~/sleeptracker/settings.json, which wake.py reads; the "Turn light off"
+button writes ~/sleeptracker/light-cmd.json, which wake.py acts on within a few seconds.
+The watch's battery and dock power come from ~/sleeptracker/watch-charge.json, which charge.py
+writes every minute.
 Sleep data comes from the watch logger's ~/sleeptracker/data/watch-YYYY-MM-DD.csv files,
 diary entries go to ~/sleeptracker/data/diary.json.
 Uses only the Python standard library, so it runs with the system python3.
@@ -17,21 +20,24 @@ import re
 import sys
 import threading
 import time
-from datetime import datetime
+from datetime import datetime, timedelta
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from urllib.parse import parse_qs, urlparse
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 from analysis.sleep_analysis import (  # noqa: E402
-    ALARM_TIME_RE, DEFAULT_SETTINGS, alarm_unix_for_night, analyze, clean_settings, read_rows, simulate_wake,
-    tuning_from_settings,
+    ALARM_TIME_RE, CHARGE_MIN_MAX, DEFAULT_SETTINGS, SUNRISE_HOLD_MINUTES, SUNRISE_MIN_BRIGHTNESS, SUNRISE_RAMP_MINUTES,
+    alarm_unix_for_night, analyze, clean_settings, read_rows, simulate_wake, tuning_from_settings,
 )
 
 BASE = Path.home() / "sleeptracker"
 DATA_DIR = BASE / "data"
 SETTINGS = BASE / "settings.json"
 DIARY = DATA_DIR / "diary.json"
+WATCH_CHARGE = BASE / "watch-charge.json"
+WATCH_CHARGE_STALE_SECONDS = 180  # charge.py writes every 60 s
+LIGHT_CMD = "light-cmd.json"  # in BASE; wake.py reads it each tick
 PAGE = Path(__file__).with_name("sleepweb.html")
 # [0-9], not \d: \d also matches other scripts' digits, such as full-width ２０２６
 NIGHT_RE = re.compile(r"watch-([0-9]{4}-[0-9]{2}-[0-9]{2})\.csv$")
@@ -61,6 +67,12 @@ def effective_settings() -> dict:
     return clean_settings(load_settings())
 
 
+def page_settings() -> dict:
+    """The effective settings plus the sunrise timings, so the page never hard-codes them."""
+    return {**effective_settings(), "sunrise_ramp_minutes": SUNRISE_RAMP_MINUTES,
+            "sunrise_hold_minutes": SUNRISE_HOLD_MINUTES}
+
+
 def save_settings(new: dict) -> dict:
     settings = load_settings()  # keys the page doesn't know, like "tuning", are kept
     if "enabled" in new:
@@ -75,6 +87,18 @@ def save_settings(new: dict) -> dict:
         settings["window_minutes"] = whole_minutes(new["window_minutes"], 0, 90, "wake window")
     if "fade_minutes" in new:
         settings["fade_minutes"] = whole_minutes(new["fade_minutes"], 1, 30, "fade length")
+    if "sunrise_enabled" in new:
+        if not isinstance(new["sunrise_enabled"], bool):
+            raise ValueError("sunrise_enabled must be true or false")
+        settings["sunrise_enabled"] = new["sunrise_enabled"]
+    if "sunrise_brightness" in new:
+        settings["sunrise_brightness"] = whole_number(
+            new["sunrise_brightness"], SUNRISE_MIN_BRIGHTNESS, 100,
+            f"peak brightness must be a whole percent from {SUNRISE_MIN_BRIGHTNESS} to 100")
+    if "charge_max" in new:
+        settings["charge_max"] = whole_number(
+            new["charge_max"], CHARGE_MIN_MAX, 100,
+            f"charge the watch to must be a whole percent from {CHARGE_MIN_MAX} to 100")
     settings["updated"] = int(time.time())
     BASE.mkdir(parents=True, exist_ok=True)
     write_atomic(SETTINGS, settings)  # wake.py never sees a half-written file
@@ -82,21 +106,25 @@ def save_settings(new: dict) -> dict:
 
 
 def whole_minutes(value, low: int, high: int, what: str) -> int:
-    message = f"{what} must be a whole number of minutes from {low} to {high}"
+    return whole_number(value, low, high, f"{what} must be a whole number of minutes from {low} to {high}")
+
+
+def whole_number(value, low: int, high: int, message: str) -> int:
     # int() would quietly turn true into 1 and 7.9 into 7
     if isinstance(value, bool) or (isinstance(value, float) and not value.is_integer()):
         raise ValueError(message)
     try:
-        minutes = int(value)
+        number = int(value)
     except (TypeError, ValueError):
         raise ValueError(message) from None
-    if not low <= minutes <= high:
+    if not low <= number <= high:
         raise ValueError(message)
-    return minutes
+    return number
 
 
 def write_atomic(path: Path, data) -> None:
-    tmp = path.with_suffix(".tmp")
+    # requests run in parallel threads, so each write needs its own tmp file
+    tmp = path.with_name(f"{path.name}.{os.getpid()}.{threading.get_ident()}.tmp")
     tmp.write_text(json.dumps(data, indent=2) + "\n")
     os.replace(tmp, path)
 
@@ -161,6 +189,73 @@ def save_diary(body: dict) -> tuple[str, dict]:
         DATA_DIR.mkdir(parents=True, exist_ok=True)
         write_atomic(DIARY, dict(sorted(entries.items())))
     return date, entry
+
+
+# ---------- sunrise light ----------
+
+def night_date(unix: float) -> str:
+    # as wake.py: anything before noon belongs to the previous evening, so the morning's light is in last night's log
+    return f"{datetime.fromtimestamp(unix) - timedelta(hours=12):%Y-%m-%d}"
+
+
+def _unix(value) -> int | None:
+    return int(value) if isinstance(value, (int, float)) and not isinstance(value, bool) else None
+
+
+def light_state(now: float) -> dict:
+    # an alarm near noon keeps its light on into the afternoon, when night_date(now) has moved on a day
+    state = {"on": False, "off_at": None}
+    for date in dict.fromkeys((night_date(now), night_date(now - 12 * 3600))):
+        log = read_json(DATA_DIR / f"wake-{date}.json")
+        light = log.get("light") if isinstance(log, dict) else None
+        if not isinstance(light, dict):
+            continue
+        off_at = _unix(light.get("off_at"))
+        on = (_unix(light.get("started")) is not None and light.get("finished") is None
+              and off_at is not None and now < off_at)
+        if on:
+            return {"on": True, "off_at": off_at}
+        if state["off_at"] is None:
+            state["off_at"] = off_at
+    return state
+
+
+def send_light_off(now: float) -> dict:
+    command = {"cmd": "off", "sent": int(now)}
+    BASE.mkdir(parents=True, exist_ok=True)
+    write_atomic(BASE / LIGHT_CMD, command)
+    return command
+
+
+# ---------- watch charging ----------
+
+WATCH_POWER = ("on", "off", "unknown")
+
+
+def _int_or_none(value) -> int | None:
+    return value if isinstance(value, int) and not isinstance(value, bool) else None
+
+
+def watch_charge_state(now: float) -> dict:
+    status = read_json(WATCH_CHARGE)
+    if not isinstance(status, dict):
+        return {"battery": None, "charging": None, "power": "unknown", "source": None,
+                "read_at": None, "updated": None, "problem": None, "stale": True}
+    battery = _int_or_none(status.get("battery"))
+    charging = status.get("charging")
+    source = status.get("source")
+    problem = status.get("problem")
+    updated = _int_or_none(status.get("updated"))
+    return {
+        "battery": battery if battery is not None and 0 <= battery <= 100 else None,
+        "charging": charging if isinstance(charging, bool) else None,
+        "power": status.get("power") if status.get("power") in WATCH_POWER else "unknown",
+        "source": source if isinstance(source, str) else None,
+        "read_at": _int_or_none(status.get("read_at")),
+        "updated": updated,
+        "problem": problem if isinstance(problem, str) else None,
+        "stale": updated is None or now - updated > WATCH_CHARGE_STALE_SECONDS,
+    }
 
 
 # ---------- nights ----------
@@ -304,7 +399,11 @@ class Handler(BaseHTTPRequestHandler):
             if url.path == "/":
                 self.send(200, PAGE.read_bytes(), "text/html; charset=utf-8")
             elif url.path == "/api/settings":
-                self.send(200, effective_settings())
+                self.send(200, page_settings())
+            elif url.path == "/api/light":
+                self.send(200, light_state(time.time()))
+            elif url.path == "/api/watch":
+                self.send(200, {**watch_charge_state(time.time()), "now": int(time.time())})
             elif url.path == "/api/nights":
                 self.send(200, {"now": int(time.time()), "nights": list_nights()})
             elif url.path == "/api/night":
@@ -322,7 +421,7 @@ class Handler(BaseHTTPRequestHandler):
 
     def do_POST(self) -> None:
         path = urlparse(self.path).path
-        if path not in ("/api/settings", "/api/diary"):
+        if path not in ("/api/settings", "/api/diary", "/api/light-off"):
             self.send(404, {"error": "not found"})
             return
         try:
@@ -333,12 +432,18 @@ class Handler(BaseHTTPRequestHandler):
             if path == "/api/settings":
                 result = save_settings(body)
                 note = f"settings changed: {json.dumps(result)}"
+            elif path == "/api/light-off":
+                result = send_light_off(time.time())
+                note = "sunrise light off requested from the app"
             else:
                 date, entry = save_diary(body)
                 result = {"date": date, "entry": entry}
                 note = f"diary saved for {date}"
         except (ValueError, TypeError) as e:
             self.send(400, {"error": str(e)})
+            return
+        except OSError as e:
+            self.send(500, {"error": f"could not save: {e}"})
             return
         self.send(200, result)
         log(note)

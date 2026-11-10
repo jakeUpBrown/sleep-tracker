@@ -11,8 +11,8 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from analysis.make_test_night import clock_time, generate, write_csv  # noqa: E402
 from analysis.sleep_analysis import (  # noqa: E402
-    DEFAULT_TUNING, STAGE_LEVEL, Detector, Row, alarm_unix_for_night, analyze, expected_cycles, parse_csv_line,
-    read_rows, simulate_wake, tuning_from_settings,
+    DEFAULT_TUNING, STAGE_LEVEL, Detector, Row, alarm_unix_for_night, analyze, clean_settings, expected_cycles,
+    parse_csv_line, read_rows, simulate_wake, sunrise_times, tuning_from_settings,
 )
 
 DATE = "2026-10-12"
@@ -117,6 +117,23 @@ class TuningTests(unittest.TestCase):
         for key in ("posture_degrees", "active_ratio", "awake_minutes", "baseline_minutes", "hr_min_confidence"):
             self.assertEqual(tuning[key], DEFAULT_TUNING[key], key)
         self.assertNotIn("unknown", tuning)
+
+
+class SunriseSettingsTests(unittest.TestCase):
+    def test_defaults(self):
+        settings = clean_settings({})
+        self.assertIs(settings["sunrise_enabled"], True)
+        self.assertEqual(settings["sunrise_brightness"], 100)
+
+    def test_only_false_switches_it_off_and_brightness_is_clamped(self):
+        self.assertIs(clean_settings({"sunrise_enabled": False})["sunrise_enabled"], False)
+        self.assertIs(clean_settings({"sunrise_enabled": "no"})["sunrise_enabled"], True)
+        self.assertEqual(clean_settings({"sunrise_brightness": 3})["sunrise_brightness"], 10)
+        self.assertEqual(clean_settings({"sunrise_brightness": 250})["sunrise_brightness"], 100)
+        self.assertEqual(clean_settings({"sunrise_brightness": "abc"})["sunrise_brightness"], 100)
+
+    def test_times_put_full_brightness_at_the_alarm(self):
+        self.assertEqual(sunrise_times(10_000), (10_000 - 30 * 60, 10_000, 10_000 + 60 * 60))
 
 
 class AnalyzeTests(unittest.TestCase):

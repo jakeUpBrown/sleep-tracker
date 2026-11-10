@@ -58,7 +58,14 @@ LONG_GAP_SECONDS = 3600            # a gap in the data longer than this is not c
 STAGE_LEVEL = {"deep": 0, "light": 1, "rem": 2, "awake": 3}  # the depth chart's y axis, bottom to top
 
 # The web app's defaults, so before anything is saved the alarm does what the page shows
-DEFAULT_SETTINGS = {"enabled": True, "alarm_time": "06:30", "window_minutes": 30, "fade_minutes": 15}
+DEFAULT_SETTINGS = {"enabled": True, "alarm_time": "06:30", "window_minutes": 30, "fade_minutes": 15,
+                    "sunrise_enabled": True, "sunrise_brightness": 100, "charge_max": 80}
+# The dawn-simulation protocol (docs/wake-prediction-research.md): a 30-minute ramp to full by the
+# alarm that stays on afterwards. A ramp of 15 minutes or less did worse than a plain alarm.
+SUNRISE_RAMP_MINUTES = 30
+SUNRISE_HOLD_MINUTES = 60
+SUNRISE_MIN_BRIGHTNESS = 10  # percent of the strip's safe maximum
+CHARGE_MIN_MAX = 50  # a lower charge_max would not cover a night (docs/watch-charging-design.md)
 # [0-9], not \d: \d also matches other scripts' digits, such as full-width ２
 ALARM_TIME_RE = re.compile(r"([01][0-9]|2[0-3]):[0-5][0-9]")
 
@@ -144,6 +151,10 @@ def clean_settings(raw) -> dict:
         "alarm_time": alarm_time if valid else None,
         "window_minutes": _whole_number(raw.get("window_minutes"), DEFAULT_SETTINGS["window_minutes"], 0, 90),
         "fade_minutes": _whole_number(raw.get("fade_minutes"), DEFAULT_SETTINGS["fade_minutes"], 1, 30),
+        "sunrise_enabled": raw.get("sunrise_enabled", DEFAULT_SETTINGS["sunrise_enabled"]) is not False,
+        "sunrise_brightness": _whole_number(raw.get("sunrise_brightness"), DEFAULT_SETTINGS["sunrise_brightness"],
+                                            SUNRISE_MIN_BRIGHTNESS, 100),
+        "charge_max": _whole_number(raw.get("charge_max"), DEFAULT_SETTINGS["charge_max"], CHARGE_MIN_MAX, 100),
         "tuning": tuning_from_settings(raw),
         "updated": _timestamp(raw.get("updated")),  # when the web app saved it
         "problem": None if valid else f"alarm_time {alarm_time!r} is not a 24-hour HH:MM time",
@@ -621,6 +632,11 @@ def wake_window(alarm_unix: int, window_minutes: int, fade_minutes: int) -> tupl
         return start, start
     window_start = alarm_unix - window_minutes * 60
     return window_start, max(alarm_unix - fade_minutes * 60, window_start)
+
+
+def sunrise_times(alarm_unix: int) -> tuple[int, int, int]:
+    """(start, full, off) of the sunrise light for one alarm: it is at full brightness at the alarm."""
+    return (alarm_unix - SUNRISE_RAMP_MINUTES * 60, alarm_unix, alarm_unix + SUNRISE_HOLD_MINUTES * 60)
 
 
 def simulate_wake(rows: list[Row], alarm_unix: int, window_minutes: int, fade_minutes: int,

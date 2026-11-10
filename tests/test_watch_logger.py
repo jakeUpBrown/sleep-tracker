@@ -96,15 +96,20 @@ class CommandJsTest(unittest.TestCase):
 
 
 class WriteStatusTest(TempDirTest):
-    def test_writes_four_keys_atomically(self):
+    def test_writes_eight_keys_atomically(self):
         path = self.dir / "watch-status.json"
         before = int(time.time())
-        write_status(path, True, 1792025223, None)
+        write_status(path, True, 1792025223, None, 78, True, False, True)
         status = json.loads(path.read_text())
-        self.assertEqual(set(status), {"connected", "last_row", "awake", "updated"})
+        self.assertEqual(set(status), {"connected", "last_row", "awake", "battery", "charging", "recording",
+                                       "hold", "updated"})
         self.assertIs(status["connected"], True)
         self.assertEqual(status["last_row"], 1792025223)
         self.assertIsNone(status["awake"])
+        self.assertEqual(status["battery"], 78)
+        self.assertIs(status["charging"], True)
+        self.assertIs(status["recording"], False)
+        self.assertIs(status["hold"], True)
         self.assertIsInstance(status["updated"], int)
         self.assertGreaterEqual(status["updated"], before)
         self.assertEqual([p.name for p in self.dir.iterdir()], ["watch-status.json"])
@@ -115,6 +120,10 @@ class WriteStatusTest(TempDirTest):
         write_status(path, False, 1, 2)
         status = json.loads(path.read_text())
         self.assertEqual((status["connected"], status["awake"]), (False, 2))
+        self.assertIsNone(status["battery"])
+        self.assertIsNone(status["charging"])
+        self.assertIsNone(status["recording"])
+        self.assertIsNone(status["hold"])
         self.assertEqual([p.name for p in self.dir.iterdir()], ["watch-status.json"])
 
 
@@ -169,6 +178,43 @@ class RecorderTest(TempDirTest):
         before = int(time.time())
         self.quietly(self.recorder.handle_line, "PL,AWAKE,")
         self.assertGreaterEqual(self.recorder.awake, before)
+
+    def flags(self):
+        status = self.status()
+        return status["battery"], status["charging"], status["recording"], status["hold"]
+
+    def test_battery_line_sets_battery_and_the_flags(self):
+        _, out = self.quietly(self.recorder.handle_line, "PB,78,1")
+        self.assertEqual(self.flags(), (78, True, False, False))
+        self.quietly(self.recorder.handle_line, "PB,77,0")
+        self.assertEqual(self.flags(), (77, False, False, False))
+        self.quietly(self.recorder.handle_line, "PB,77,2")  # recording, off the charger
+        self.assertEqual(self.flags(), (77, False, True, False))
+        self.quietly(self.recorder.handle_line, "PB,77,5")  # stopped by hand, charger live
+        self.assertEqual(self.flags(), (77, True, False, True))
+        self.assertEqual(self.csv_lines(), [])  # no data row for it
+        self.assertEqual(out, "")
+
+    def test_garbled_battery_line_is_skipped(self):
+        for line in ["PB,abc", "PB,80", "PB,abc,1"]:
+            with self.subTest(line=line):
+                _, out = self.quietly(self.recorder.handle_line, line)
+                self.assertIn("garbled", out)
+                self.assertIsNone(self.recorder.battery)
+                self.assertIsNone(self.recorder.charging)
+                self.assertFalse(self.status_path.exists())
+                self.assertEqual(self.csv_lines(), [])
+
+    def test_data_row_updates_battery_and_means_recording(self):
+        self.quietly(self.recorder.handle_line, "PB,78,1")
+        self.quietly(self.recorder.handle_line, GOOD_LINE)
+        self.assertEqual(self.flags(), (90, True, True, False))
+
+    def test_a_new_connection_forgets_the_old_reading(self):
+        self.quietly(self.recorder.handle_line, "PB,78,3")
+        self.recorder.set_connected(False)
+        self.recorder.set_connected(True)
+        self.assertEqual(self.flags(), (None, None, None, None))
 
     def test_connected_flag_is_saved(self):
         self.recorder.set_connected(True)

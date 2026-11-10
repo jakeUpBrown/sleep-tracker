@@ -9,3 +9,5 @@ bangle.json
 # Local copies of the Pi's data folder (scp'd here for analysis), and editor temp files
 data/
 *.tmp
+# Claude Code session worktrees
+.claude/worktrees/
